@@ -60,6 +60,95 @@ pub fn pump_bytes<R: Read, W: Write>(src: &mut R, dst: &mut W) -> std::io::Resul
     std::io::copy(src, dst)
 }
 
+/// Bridge two read+write endpoints in both directions until either closes
+/// or `stop` is set. Both endpoints must be in non-blocking mode and surface
+/// `WouldBlock` rather than panicking on no-data; this is the single-threaded
+/// alternative to spawning two threads with a split connection (which ssh2's
+/// `Channel` doesn't support — it isn't `Send` for `&mut`-sharing).
+///
+/// Returns the total bytes copied in (a→b, b→a).
+pub fn bridge_bidirectional<A, B>(
+    a: &mut A,
+    b: &mut B,
+    stop: &AtomicBool,
+) -> std::io::Result<(u64, u64)>
+where
+    A: Read + Write,
+    B: Read + Write,
+{
+    let mut buf = [0u8; 8192];
+    let mut a_to_b: u64 = 0;
+    let mut b_to_a: u64 = 0;
+    let mut a_done = false;
+    let mut b_done = false;
+
+    while !stop.load(Ordering::SeqCst) && !(a_done && b_done) {
+        let mut progressed = false;
+
+        if !a_done {
+            match a.read(&mut buf) {
+                Ok(0) => a_done = true,
+                Ok(n) => {
+                    write_all_nonblocking(b, &buf[..n])?;
+                    a_to_b += n as u64;
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !b_done {
+            match b.read(&mut buf) {
+                Ok(0) => b_done = true,
+                Ok(n) => {
+                    write_all_nonblocking(a, &buf[..n])?;
+                    b_to_a += n as u64;
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    Ok((a_to_b, b_to_a))
+}
+
+/// Like `Write::write_all`, but tolerates `WouldBlock` by busy-waiting briefly.
+/// Bounded so a stuck remote doesn't deadlock the bridge loop.
+fn write_all_nonblocking<W: Write>(w: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
+    let mut spins = 0u32;
+    while !buf.is_empty() {
+        match w.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write returned 0",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                spins = 0;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                spins += 1;
+                if spins > 1000 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "write blocked for too long",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Handle to an active reverse forward. Dropping the handle signals the
 /// worker thread to stop.
 pub struct ReverseForward {
@@ -137,6 +226,8 @@ pub fn open_ssh2_reverse_forward(
         return Err(anyhow!("ssh authentication failed"));
     }
     sess.set_keepalive(true, cfg.keepalive.as_secs() as u32);
+    // Non-blocking so bridge_bidirectional can poll the channel.
+    sess.set_blocking(false);
 
     let (listener, _bound) = sess
         .channel_forward_listen(remote_port, Some(&cfg.host), None)
@@ -146,17 +237,21 @@ pub fn open_ssh2_reverse_forward(
     let stop_worker = stop.clone();
 
     let worker = thread::spawn(move || {
-        // The accept loop is intentionally minimal here; commit 7 layers on
-        // bidirectional pumping to localhost and proper error handling once
-        // we can exercise it against a live bastion.
         let mut listener = listener;
         while !stop_worker.load(Ordering::SeqCst) {
             match listener.accept() {
-                Ok(_channel) => {
-                    // Bridging to localhost:local_port is wired in commit 7.
+                Ok(channel) => {
+                    let stop_for_bridge = stop_worker.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = handle_accepted_channel(channel, local_port, &stop_for_bridge) {
+                            tracing::warn!(?e, "bridging accepted channel failed");
+                        }
+                    });
                 }
                 Err(_) => {
-                    thread::sleep(Duration::from_millis(200));
+                    // ssh2 returns errors when there's nothing to accept yet;
+                    // sleep a beat to avoid pegging the CPU.
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         }
@@ -168,6 +263,23 @@ pub fn open_ssh2_reverse_forward(
         stop,
         worker,
     ))
+}
+
+/// Bridge an accepted SSH channel to `127.0.0.1:local_port`. The TCP socket
+/// is set non-blocking up front so `bridge_bidirectional` can poll both ends.
+fn handle_accepted_channel(
+    mut channel: ssh2::Channel,
+    local_port: u16,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let tcp = std::net::TcpStream::connect(("127.0.0.1", local_port))
+        .with_context(|| format!("connecting to 127.0.0.1:{local_port}"))?;
+    tcp.set_nonblocking(true)
+        .context("setting TCP socket non-blocking")?;
+    let mut tcp = tcp;
+    let _ = bridge_bidirectional(&mut channel, &mut tcp, stop);
+    let _ = channel.close();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,6 +385,82 @@ mod tests {
 
         assert_eq!(n as usize, b"reverse tunnel payload".len());
         assert_eq!(*received.lock().unwrap(), b"reverse tunnel payload");
+    }
+
+    #[test]
+    fn bridge_bidirectional_forwards_bytes() {
+        use std::net::{TcpListener, TcpStream};
+
+        // Two TCP pairs stand in for (driver, ssh-channel) and (local-service, bastion-tcp).
+        let driver_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let driver_addr = driver_listener.local_addr().unwrap();
+        let svc_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let svc_addr = svc_listener.local_addr().unwrap();
+
+        let mut driver = TcpStream::connect(driver_addr).unwrap();
+        let (a_side, _) = driver_listener.accept().unwrap();
+        let b_side = TcpStream::connect(svc_addr).unwrap();
+        let (mut svc, _) = svc_listener.accept().unwrap();
+
+        a_side.set_nonblocking(true).unwrap();
+        b_side.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let bridge_thread = thread::spawn(move || {
+            let mut a = a_side;
+            let mut b = b_side;
+            bridge_bidirectional(&mut a, &mut b, &stop_w).ok();
+        });
+
+        // a -> b: write into driver, expect bytes on svc.
+        driver.write_all(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        svc.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+
+        // b -> a: write into svc, expect bytes on driver.
+        svc.write_all(b"world").unwrap();
+        let mut buf = [0u8; 5];
+        driver.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+
+        stop.store(true, Ordering::SeqCst);
+        bridge_thread.join().unwrap();
+    }
+
+    #[test]
+    fn bridge_bidirectional_honors_stop_flag_with_idle_streams() {
+        use std::net::{TcpListener, TcpStream};
+        // Two idle TCP pairs that never send anything; the bridge should
+        // exit promptly when the stop flag is set rather than spin forever.
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a1 = l1.local_addr().unwrap();
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let _client1 = TcpStream::connect(a1).unwrap();
+        let _client2 = TcpStream::connect(a2).unwrap();
+        let (s1, _) = l1.accept().unwrap();
+        let (s2, _) = l2.accept().unwrap();
+        s1.set_nonblocking(true).unwrap();
+        s2.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let join = thread::spawn(move || {
+            let mut s1 = s1;
+            let mut s2 = s2;
+            bridge_bidirectional(&mut s1, &mut s2, &stop_w).ok();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        join.join().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "bridge did not honor stop flag within 1s"
+        );
     }
 
     #[test]
