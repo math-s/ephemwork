@@ -1,4 +1,5 @@
 pub mod bastion_client;
+pub mod bastion_provisioner;
 pub mod cli;
 pub mod commands;
 pub mod config;
