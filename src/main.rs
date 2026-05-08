@@ -3,9 +3,11 @@ use ephemwork::bastion_provisioner::{
     render_bastion_status, run_destroy, run_init, run_status as run_bastion_status,
     security_group_plan, LaunchPlan, PlanLogger,
 };
-use ephemwork::cli::{BastionCommand, BastionDestroyArgs, BastionInitArgs, Cli, Command};
-use ephemwork::commands::{render_status, status as run_status};
-use ephemwork::config::Config;
+use ephemwork::cli::{BastionCommand, BastionDestroyArgs, BastionInitArgs, Cli, Command, UpArgs, DownArgs};
+use ephemwork::commands::{
+    down_service, render_status, status as run_status, up_service, UpRequest,
+};
+use ephemwork::config::{current_user, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,19 +16,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
 
     match cli.command {
-        Command::Up(args) => {
-            // Full up flow (SSM forward + SSH reverse tunnel + process + bastion
-            // registration) is wired against a live bastion in Phase 1's manual
-            // smoke test; commit 8 lights up the bastion server itself.
-            println!(
-                "up: {} (Phase 1 wiring - run smoke test against a live bastion)",
-                args.service
-            );
-        }
-        Command::Down(args) => match args.service {
-            Some(service) => println!("down: {service} (Phase 1 wiring)"),
-            None => println!("down: all services (Phase 1 wiring)"),
-        },
+        Command::Up(args) => up(args).await?,
+        Command::Down(args) => down(args).await?,
         Command::Status => {
             let out = run_status()?;
             println!("{}", render_status(&out));
@@ -38,6 +29,44 @@ async fn main() -> anyhow::Result<()> {
         },
     }
 
+    Ok(())
+}
+
+async fn up(args: UpArgs) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let user = current_user()?;
+    let req = UpRequest::from_config(&cfg, &args.service, &user)?;
+    let session = up_service(req).await?;
+
+    println!();
+    println!("✓ {} is live.", session.service);
+    println!("  set this header on staging requests to route to your laptop:");
+    println!();
+    println!("    {}", session.header_line());
+    println!();
+    println!("  pid={}  local:{}  bastion-port:{}", session.pid, session.local_port, session.remote_port);
+    println!();
+    println!("Press Ctrl-C to stop.");
+
+    tokio::signal::ctrl_c().await?;
+    println!();
+    println!("Shutting down…");
+    session.shutdown();
+    Ok(())
+}
+
+async fn down(args: DownArgs) -> anyhow::Result<()> {
+    let removed = down_service(args.service.clone()).await?;
+    if removed.is_empty() {
+        match args.service {
+            Some(svc) => println!("no active session named {svc}"),
+            None => println!("no active sessions"),
+        }
+    } else {
+        for s in &removed {
+            println!("cleaned up {} (was bastion-port {})", s.service, s.remote_port);
+        }
+    }
     Ok(())
 }
 
