@@ -8,6 +8,7 @@
 
 mod handlers;
 mod http;
+mod nginx;
 mod registry;
 
 use anyhow::{Context, Result};
