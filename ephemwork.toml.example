@@ -1,0 +1,12 @@
+// Config for ephemwork
+
+[default]
+service_name = "backend"
+
+docker_compose_file = "docker-compose.yml"
+
+[tunnel]
+provider = "ngrok"  # or cloudflared
+
+[header]
+name = "X-Ephemwork"
