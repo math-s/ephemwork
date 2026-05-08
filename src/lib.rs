@@ -1,4 +1,7 @@
+pub mod bastion_client;
+pub mod bastion_protocol;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod runner;
 pub mod ssm;
