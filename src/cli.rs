@@ -38,11 +38,37 @@ pub struct DownArgs {
 #[derive(Subcommand, Debug)]
 pub enum BastionCommand {
     /// Provision the bastion EC2, security group, IAM role, and control plane.
-    Init,
+    Init(BastionInitArgs),
     /// Tear down the bastion and its supporting resources.
     Destroy,
     /// Show bastion status (instance ID, registered sessions).
     Status,
+}
+
+#[derive(Args, Debug)]
+pub struct BastionInitArgs {
+    /// AMI ID to launch (must be arm64 with SSM agent, e.g. AL2023 arm64).
+    #[arg(long)]
+    pub ami_id: String,
+
+    /// Subnet ID inside the staging VPC.
+    #[arg(long)]
+    pub subnet_id: String,
+
+    /// Security group ID of the staging ALB. The bastion's SG only allows
+    /// inbound 80 from this SG.
+    #[arg(long)]
+    pub alb_security_group_id: String,
+
+    /// S3 URL of the prebuilt bastion-server arm64 binary.
+    /// Example: s3://my-bucket/ephemwork-bastion-server
+    #[arg(long)]
+    pub bastion_binary_s3_uri: String,
+
+    /// Actually call AWS. Without this flag, ephemwork prints the plan and
+    /// exits without creating any resources.
+    #[arg(long, default_value_t = false)]
+    pub live: bool,
 }
 
 impl Cli {
@@ -112,9 +138,69 @@ mod tests {
     }
 
     #[test]
-    fn bastion_init_parses() {
-        let cli = parse(&["ephemwork", "bastion", "init"]);
-        assert!(matches!(cli.command, Command::Bastion(BastionCommand::Init)));
+    fn bastion_init_parses_all_required_flags() {
+        let cli = parse(&[
+            "ephemwork",
+            "bastion",
+            "init",
+            "--ami-id",
+            "ami-1234",
+            "--subnet-id",
+            "subnet-abc",
+            "--alb-security-group-id",
+            "sg-alb",
+            "--bastion-binary-s3-uri",
+            "s3://bucket/bin",
+        ]);
+        match cli.command {
+            Command::Bastion(BastionCommand::Init(args)) => {
+                assert_eq!(args.ami_id, "ami-1234");
+                assert_eq!(args.subnet_id, "subnet-abc");
+                assert_eq!(args.alb_security_group_id, "sg-alb");
+                assert_eq!(args.bastion_binary_s3_uri, "s3://bucket/bin");
+                assert!(!args.live, "--live should default to false (dry run)");
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bastion_init_live_flag_parses() {
+        let cli = parse(&[
+            "ephemwork",
+            "bastion",
+            "init",
+            "--ami-id",
+            "ami-1",
+            "--subnet-id",
+            "subnet-1",
+            "--alb-security-group-id",
+            "sg-1",
+            "--bastion-binary-s3-uri",
+            "s3://b/b",
+            "--live",
+        ]);
+        match cli.command {
+            Command::Bastion(BastionCommand::Init(args)) => assert!(args.live),
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bastion_init_requires_ami() {
+        let err = Cli::try_parse_from_iter([
+            "ephemwork",
+            "bastion",
+            "init",
+            "--subnet-id",
+            "s",
+            "--alb-security-group-id",
+            "sg",
+            "--bastion-binary-s3-uri",
+            "s3://b/b",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("ami"));
     }
 
     #[test]
