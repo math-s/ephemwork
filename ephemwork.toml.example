@@ -1,12 +1,14 @@
-// Config for ephemwork
-
-[default]
-service_name = "backend"
-
-docker_compose_file = "docker-compose.yml"
-
 [tunnel]
-provider = "ngrok"  # or cloudflared
+type = "ec2"
+region = "us-east-1"
+instance_type = "t4g.nano"
 
-[header]
-name = "X-Ephemwork"
+[service.backend]
+port = 8080
+build_command = "cargo build"
+run_command = "cargo run"
+health_check_path = "/health"
+
+[service.worker]
+port = 9090
+run_command = "python worker.py"
