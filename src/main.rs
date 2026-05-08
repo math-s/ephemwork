@@ -1,3 +1,4 @@
+use ephemwork::aws_bastion_provisioner::AwsBastionProvisioner;
 use ephemwork::bastion_provisioner::{
     render_bastion_status, run_destroy, run_init, run_status as run_bastion_status,
     security_group_plan, LaunchPlan, PlanLogger,
@@ -31,16 +32,16 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", render_status(&out));
         }
         Command::Bastion(cmd) => match cmd {
-            BastionCommand::Init(args) => bastion_init(args)?,
-            BastionCommand::Destroy(args) => bastion_destroy(args)?,
-            BastionCommand::Status => bastion_status()?,
+            BastionCommand::Init(args) => bastion_init(args).await?,
+            BastionCommand::Destroy(args) => bastion_destroy(args).await?,
+            BastionCommand::Status => bastion_status().await?,
         },
     }
 
     Ok(())
 }
 
-fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
+async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let sg_plan = security_group_plan(&args.alb_security_group_id)?;
 
@@ -62,15 +63,25 @@ fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    Err(anyhow::anyhow!(
-        "live AWS provisioning is not yet implemented; the BastionProvisioner trait \
-         in src/bastion_provisioner.rs defines the four calls needed against \
-         aws-sdk-ec2 / aws-sdk-iam. Until that lands, run without --live to view \
-         the plan."
-    ))
+    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
+    let outcome = run_init(&mut provisioner, &sg_plan, |sg_id| {
+        LaunchPlan::from_config(
+            &cfg.tunnel,
+            &args.ami_id,
+            &args.subnet_id,
+            sg_id,
+            &args.bastion_binary_s3_uri,
+        )
+    })?;
+    println!(
+        "bastion provisioned: instance={} security_group={}",
+        outcome.instance_id, outcome.security_group_id
+    );
+    println!("next: add the ALB listener rule documented in README.md, then `ephemwork up <service>`.");
+    Ok(())
 }
 
-fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
+async fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
     if !args.live {
         let mut logger = PlanLogger::new();
         let outcome = run_destroy(&mut logger)?;
@@ -83,17 +94,21 @@ fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    Err(anyhow::anyhow!(
-        "live AWS teardown is not yet implemented; provide a BastionProvisioner \
-         impl wired against aws-sdk-ec2 / aws-sdk-iam. Without --live, the dry \
-         run prints the plan."
-    ))
+
+    let cfg = Config::load()?;
+    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
+    let outcome = run_destroy(&mut provisioner)?;
+    match outcome.instance_id {
+        Some(id) => println!("terminated {id}; security group + IAM role removed."),
+        None => println!("nothing to do (no bastion instance found)."),
+    }
+    Ok(())
 }
 
-fn bastion_status() -> anyhow::Result<()> {
-    let mut logger = PlanLogger::new();
-    let status = run_bastion_status(&mut logger)?;
+async fn bastion_status() -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
+    let status = run_bastion_status(&mut provisioner)?;
     println!("{}", render_bastion_status(&status));
-    println!("(dry run; live AWS lookup pending --live wiring of BastionProvisioner)");
     Ok(())
 }
