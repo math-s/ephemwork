@@ -1,46 +1,27 @@
-use clap::Parser;
-
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(clap::Subcommand)]
-enum Commands {
-    Up(UpArgs),
-    Down(DownArgs),
-    Status,
-}
-
-#[derive(clap::Args)]
-struct UpArgs {
-    service: String,
-}
-
-#[derive(clap::Args)]
-struct DownArgs {
-    service: Option<String>,
-}
+use ephemwork::cli::{BastionCommand, Cli, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_args();
 
     match cli.command {
-        Commands::Up(args) => {
-            println!("🚀 Starting {} locally...", args.service);
-            // TODO: load config, run docker compose, setup tunnel
+        Command::Up(args) => {
+            println!("up: {} (not yet implemented)", args.service);
         }
-        Commands::Down(args) => {
-            println!("🛑 Stopping service...");
+        Command::Down(args) => match args.service {
+            Some(service) => println!("down: {service} (not yet implemented)"),
+            None => println!("down: all services for current user (not yet implemented)"),
+        },
+        Command::Status => {
+            println!("status: (not yet implemented)");
         }
-        Commands::Status => {
-            println!("📊 Current status");
-        }
+        Command::Bastion(cmd) => match cmd {
+            BastionCommand::Init => println!("bastion init (not yet implemented)"),
+            BastionCommand::Destroy => println!("bastion destroy (not yet implemented)"),
+            BastionCommand::Status => println!("bastion status (not yet implemented)"),
+        },
     }
 
     Ok(())
