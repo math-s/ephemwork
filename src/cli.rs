@@ -40,9 +40,17 @@ pub enum BastionCommand {
     /// Provision the bastion EC2, security group, IAM role, and control plane.
     Init(BastionInitArgs),
     /// Tear down the bastion and its supporting resources.
-    Destroy,
-    /// Show bastion status (instance ID, registered sessions).
+    Destroy(BastionDestroyArgs),
+    /// Show bastion status (instance ID, state).
     Status,
+}
+
+#[derive(Args, Debug)]
+pub struct BastionDestroyArgs {
+    /// Actually call AWS. Without this flag, ephemwork prints the plan and
+    /// exits without deleting any resources.
+    #[arg(long, default_value_t = false)]
+    pub live: bool,
 }
 
 #[derive(Args, Debug)]
@@ -206,10 +214,19 @@ mod tests {
     #[test]
     fn bastion_destroy_parses() {
         let cli = parse(&["ephemwork", "bastion", "destroy"]);
-        assert!(matches!(
-            cli.command,
-            Command::Bastion(BastionCommand::Destroy)
-        ));
+        match cli.command {
+            Command::Bastion(BastionCommand::Destroy(args)) => assert!(!args.live),
+            other => panic!("expected Destroy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bastion_destroy_live_flag_parses() {
+        let cli = parse(&["ephemwork", "bastion", "destroy", "--live"]);
+        match cli.command {
+            Command::Bastion(BastionCommand::Destroy(args)) => assert!(args.live),
+            other => panic!("expected Destroy, got {other:?}"),
+        }
     }
 
     #[test]
