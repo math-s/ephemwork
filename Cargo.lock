@@ -801,6 +801,7 @@ dependencies = [
  "aws-sdk-ssm",
  "chrono",
  "clap",
+ "ephemwork-common",
  "rand",
  "serde",
  "serde_json",
@@ -811,6 +812,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "ephemwork-bastion-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ephemwork-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ephemwork-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

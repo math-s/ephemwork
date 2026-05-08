@@ -1,8 +1,7 @@
-//! Wire types for the bastion control plane.
+//! Wire types shared between the laptop CLI and the bastion control plane.
 //!
-//! These move to a shared `common/` crate in commit 8 when the bastion
-//! server is introduced as a workspace member; they live here for now so
-//! commit 7 can stand alone.
+//! Lives in its own crate so that changes to the bastion server can't compile
+//! against incompatible request/response shapes.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +26,15 @@ pub struct DeregisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Header that staging traffic carries to be routed to a developer's tunnel.
+pub const ROUTING_HEADER: &str = "X-Ephemwork";
+
+/// Build the header value for a (user, service) pair. User is lower-cased so
+/// the bastion can match deterministically; service casing is preserved.
+pub fn routing_header_value(user: &str, service: &str) -> String {
+    format!("{}:{}", user.trim().to_lowercase(), service.trim())
 }
 
 #[cfg(test)]
@@ -65,8 +73,17 @@ mod tests {
 
     #[test]
     fn register_response_rejects_missing_field() {
-        // remote_port is required; absence must error rather than default.
         let res: Result<RegisterResponse, _> = serde_json::from_str("{}");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn header_value_lowercases_user_only() {
+        assert_eq!(routing_header_value("Matheus", "API-v2"), "matheus:API-v2");
+    }
+
+    #[test]
+    fn header_value_trims_whitespace() {
+        assert_eq!(routing_header_value("  alice ", "  api "), "alice:api");
     }
 }
