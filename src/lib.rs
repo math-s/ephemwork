@@ -1,3 +1,4 @@
+pub mod aws_bastion_provisioner;
 pub mod bastion_client;
 pub mod bastion_provisioner;
 pub mod cli;
