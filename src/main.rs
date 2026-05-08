@@ -1,7 +1,8 @@
 use ephemwork::bastion_provisioner::{
-    run_init, security_group_plan, LaunchPlan, PlanLogger,
+    render_bastion_status, run_destroy, run_init, run_status as run_bastion_status,
+    security_group_plan, LaunchPlan, PlanLogger,
 };
-use ephemwork::cli::{BastionCommand, BastionInitArgs, Cli, Command};
+use ephemwork::cli::{BastionCommand, BastionDestroyArgs, BastionInitArgs, Cli, Command};
 use ephemwork::commands::{render_status, status as run_status};
 use ephemwork::config::Config;
 
@@ -31,8 +32,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Bastion(cmd) => match cmd {
             BastionCommand::Init(args) => bastion_init(args)?,
-            BastionCommand::Destroy => println!("bastion destroy (lands in commit 11)"),
-            BastionCommand::Status => println!("bastion status (lands in commit 11)"),
+            BastionCommand::Destroy(args) => bastion_destroy(args)?,
+            BastionCommand::Status => bastion_status()?,
         },
     }
 
@@ -67,4 +68,32 @@ fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
          aws-sdk-ec2 / aws-sdk-iam. Until that lands, run without --live to view \
          the plan."
     ))
+}
+
+fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
+    if !args.live {
+        let mut logger = PlanLogger::new();
+        let outcome = run_destroy(&mut logger)?;
+        println!("Dry run (no AWS calls). Re-run with --live to delete.");
+        for line in &logger.log {
+            println!("  {line}");
+        }
+        if let Some(id) = &outcome.instance_id {
+            println!("  (would terminate {id})");
+        }
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "live AWS teardown is not yet implemented; provide a BastionProvisioner \
+         impl wired against aws-sdk-ec2 / aws-sdk-iam. Without --live, the dry \
+         run prints the plan."
+    ))
+}
+
+fn bastion_status() -> anyhow::Result<()> {
+    let mut logger = PlanLogger::new();
+    let status = run_bastion_status(&mut logger)?;
+    println!("{}", render_bastion_status(&status));
+    println!("(dry run; live AWS lookup pending --live wiring of BastionProvisioner)");
+    Ok(())
 }

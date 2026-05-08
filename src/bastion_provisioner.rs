@@ -211,6 +211,78 @@ pub trait BastionProvisioner {
     fn ensure_iam_role(&mut self) -> Result<()>;
     fn launch_instance(&mut self, plan: &LaunchPlan) -> Result<String>;
     fn wait_until_running(&mut self, instance_id: &str) -> Result<()>;
+
+    /// Look up the bastion instance by `Name` tag. Returns `None` if no
+    /// instance is currently tagged with `BASTION_NAME`.
+    fn find_instance_by_name(&mut self, name: &str) -> Result<Option<InstanceSummary>>;
+
+    fn terminate_instance(&mut self, instance_id: &str) -> Result<()>;
+    fn delete_security_group(&mut self, security_group_id: &str) -> Result<()>;
+    fn delete_iam_role(&mut self) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceSummary {
+    pub instance_id: String,
+    pub state: String,
+    pub private_ip: Option<String>,
+    pub security_group_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct DestroyOutcome {
+    pub instance_id: Option<String>,
+    pub security_group_id: Option<String>,
+}
+
+/// Tear down the bastion in reverse order. Failure modes:
+///   - No instance tagged BASTION_NAME: returns Ok with empty IDs (idempotent).
+///   - SG removal failure: returned to caller; instance termination has
+///     already happened so a re-run will skip it.
+pub fn run_destroy(provisioner: &mut dyn BastionProvisioner) -> Result<DestroyOutcome> {
+    let summary = provisioner.find_instance_by_name(BASTION_NAME)?;
+    let Some(summary) = summary else {
+        return Ok(DestroyOutcome::default());
+    };
+    provisioner.terminate_instance(&summary.instance_id)?;
+    if let Some(sg_id) = &summary.security_group_id {
+        provisioner.delete_security_group(sg_id)?;
+    }
+    provisioner.delete_iam_role()?;
+    Ok(DestroyOutcome {
+        instance_id: Some(summary.instance_id),
+        security_group_id: summary.security_group_id,
+    })
+}
+
+/// What `bastion status` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BastionStatus {
+    pub instance: Option<InstanceSummary>,
+}
+
+pub fn run_status(provisioner: &mut dyn BastionProvisioner) -> Result<BastionStatus> {
+    let instance = provisioner.find_instance_by_name(BASTION_NAME)?;
+    Ok(BastionStatus { instance })
+}
+
+pub fn render_bastion_status(status: &BastionStatus) -> String {
+    match &status.instance {
+        None => format!(
+            "no bastion found (no instance tagged Name={BASTION_NAME}).\n\
+             run `ephemwork bastion init --live ...` to provision one."
+        ),
+        Some(s) => {
+            let ip = s.private_ip.as_deref().unwrap_or("?");
+            let sg = s.security_group_id.as_deref().unwrap_or("?");
+            format!(
+                "bastion: {id}  state={state}  private_ip={ip}  sg={sg}\n\
+                 (active sessions live in /var/lib/ephemwork/registry.json on the bastion)",
+                id = s.instance_id,
+                state = s.state,
+            )
+        }
+    }
 }
 
 /// Dry-run provisioner: prints what *would* happen instead of calling AWS.
@@ -268,6 +340,32 @@ impl BastionProvisioner for PlanLogger {
     fn wait_until_running(&mut self, instance_id: &str) -> Result<()> {
         self.log
             .push(format!("[plan] wait until {instance_id} is running"));
+        Ok(())
+    }
+    fn find_instance_by_name(&mut self, name: &str) -> Result<Option<InstanceSummary>> {
+        self.log
+            .push(format!("[plan] look up instance tagged Name={name}"));
+        Ok(Some(InstanceSummary {
+            instance_id: "i-DRYRUN".into(),
+            state: "running".into(),
+            private_ip: Some("10.0.0.42".into()),
+            security_group_id: Some("sg-DRYRUN".into()),
+        }))
+    }
+    fn terminate_instance(&mut self, instance_id: &str) -> Result<()> {
+        self.log
+            .push(format!("[plan] terminate instance {instance_id}"));
+        Ok(())
+    }
+    fn delete_security_group(&mut self, security_group_id: &str) -> Result<()> {
+        self.log
+            .push(format!("[plan] delete security group {security_group_id}"));
+        Ok(())
+    }
+    fn delete_iam_role(&mut self) -> Result<()> {
+        self.log.push(format!(
+            "[plan] delete IAM role {IAM_ROLE_NAME} + instance profile {IAM_INSTANCE_PROFILE_NAME}"
+        ));
         Ok(())
     }
 }
@@ -397,6 +495,7 @@ mod tests {
         calls: Vec<&'static str>,
         last_sg_plan: Option<SecurityGroupPlan>,
         last_launch_plan: Option<LaunchPlan>,
+        instance_to_return: Option<InstanceSummary>,
     }
     impl BastionProvisioner for MockProvisioner {
         fn ensure_security_group(&mut self, plan: &SecurityGroupPlan) -> Result<String> {
@@ -415,6 +514,22 @@ mod tests {
         }
         fn wait_until_running(&mut self, _instance_id: &str) -> Result<()> {
             self.calls.push("wait_until_running");
+            Ok(())
+        }
+        fn find_instance_by_name(&mut self, _name: &str) -> Result<Option<InstanceSummary>> {
+            self.calls.push("find_instance_by_name");
+            Ok(self.instance_to_return.clone())
+        }
+        fn terminate_instance(&mut self, _instance_id: &str) -> Result<()> {
+            self.calls.push("terminate_instance");
+            Ok(())
+        }
+        fn delete_security_group(&mut self, _sg_id: &str) -> Result<()> {
+            self.calls.push("delete_security_group");
+            Ok(())
+        }
+        fn delete_iam_role(&mut self) -> Result<()> {
+            self.calls.push("delete_iam_role");
             Ok(())
         }
     }
@@ -487,6 +602,18 @@ mod tests {
             fn wait_until_running(&mut self, _: &str) -> Result<()> {
                 panic!("must not be called")
             }
+            fn find_instance_by_name(&mut self, _: &str) -> Result<Option<InstanceSummary>> {
+                panic!("must not be called")
+            }
+            fn terminate_instance(&mut self, _: &str) -> Result<()> {
+                panic!("must not be called")
+            }
+            fn delete_security_group(&mut self, _: &str) -> Result<()> {
+                panic!("must not be called")
+            }
+            fn delete_iam_role(&mut self) -> Result<()> {
+                panic!("must not be called")
+            }
         }
         let mut p = Failing;
         let sg_plan = security_group_plan("sg-alb").unwrap();
@@ -494,5 +621,105 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("denied"), "got: {err}");
+    }
+
+    #[test]
+    fn run_destroy_short_circuits_when_no_instance() {
+        let mut p = MockProvisioner {
+            instance_to_return: None,
+            ..Default::default()
+        };
+        let outcome = run_destroy(&mut p).unwrap();
+        assert!(outcome.instance_id.is_none());
+        assert_eq!(p.calls, vec!["find_instance_by_name"]);
+    }
+
+    #[test]
+    fn run_destroy_terminates_then_deletes_supporting_resources() {
+        let mut p = MockProvisioner {
+            instance_to_return: Some(InstanceSummary {
+                instance_id: "i-real".into(),
+                state: "running".into(),
+                private_ip: Some("10.0.0.5".into()),
+                security_group_id: Some("sg-real".into()),
+            }),
+            ..Default::default()
+        };
+        let outcome = run_destroy(&mut p).unwrap();
+        assert_eq!(outcome.instance_id.as_deref(), Some("i-real"));
+        assert_eq!(outcome.security_group_id.as_deref(), Some("sg-real"));
+        assert_eq!(
+            p.calls,
+            vec![
+                "find_instance_by_name",
+                "terminate_instance",
+                "delete_security_group",
+                "delete_iam_role",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_destroy_skips_sg_when_summary_lacks_one() {
+        let mut p = MockProvisioner {
+            instance_to_return: Some(InstanceSummary {
+                instance_id: "i-orphan".into(),
+                state: "stopped".into(),
+                private_ip: None,
+                security_group_id: None,
+            }),
+            ..Default::default()
+        };
+        run_destroy(&mut p).unwrap();
+        assert!(!p.calls.iter().any(|c| *c == "delete_security_group"));
+        assert!(p.calls.iter().any(|c| *c == "delete_iam_role"));
+    }
+
+    #[test]
+    fn run_status_returns_summary_when_present() {
+        let mut p = MockProvisioner {
+            instance_to_return: Some(InstanceSummary {
+                instance_id: "i-99".into(),
+                state: "running".into(),
+                private_ip: Some("10.0.0.7".into()),
+                security_group_id: Some("sg-99".into()),
+            }),
+            ..Default::default()
+        };
+        let s = run_status(&mut p).unwrap();
+        assert_eq!(s.instance.as_ref().unwrap().instance_id, "i-99");
+    }
+
+    #[test]
+    fn render_bastion_status_no_instance() {
+        let s = render_bastion_status(&BastionStatus { instance: None });
+        assert!(s.contains("no bastion found"));
+        assert!(s.contains("ephemwork bastion init"));
+    }
+
+    #[test]
+    fn render_bastion_status_with_instance() {
+        let s = render_bastion_status(&BastionStatus {
+            instance: Some(InstanceSummary {
+                instance_id: "i-99".into(),
+                state: "running".into(),
+                private_ip: Some("10.0.0.7".into()),
+                security_group_id: Some("sg-99".into()),
+            }),
+        });
+        assert!(s.contains("i-99"));
+        assert!(s.contains("running"));
+        assert!(s.contains("10.0.0.7"));
+        assert!(s.contains("sg-99"));
+    }
+
+    #[test]
+    fn plan_logger_destroy_records_each_step() {
+        let mut logger = PlanLogger::new();
+        run_destroy(&mut logger).unwrap();
+        assert!(logger.log.iter().any(|l| l.contains("look up instance")));
+        assert!(logger.log.iter().any(|l| l.contains("terminate instance")));
+        assert!(logger.log.iter().any(|l| l.contains("delete security group")));
+        assert!(logger.log.iter().any(|l| l.contains("delete IAM role")));
     }
 }
