@@ -51,19 +51,18 @@ impl AwsBastionProvisioner {
     }
 
     async fn iam_role_exists(&self, name: &str) -> Result<bool> {
+        use aws_sdk_iam::operation::get_role::GetRoleError;
         match self.iam.get_role().role_name(name).send().await {
             Ok(_) => Ok(true),
-            Err(e) => {
-                if iam_no_such_entity(&e.to_string()) {
-                    Ok(false)
-                } else {
-                    Err(e).context("get_role")
-                }
-            }
+            Err(e) => match e.into_service_error() {
+                GetRoleError::NoSuchEntityException(_) => Ok(false),
+                other => Err(anyhow!("get_role failed: {other}")),
+            },
         }
     }
 
     async fn instance_profile_exists(&self, name: &str) -> Result<bool> {
+        use aws_sdk_iam::operation::get_instance_profile::GetInstanceProfileError;
         match self
             .iam
             .get_instance_profile()
@@ -72,13 +71,10 @@ impl AwsBastionProvisioner {
             .await
         {
             Ok(_) => Ok(true),
-            Err(e) => {
-                if iam_no_such_entity(&e.to_string()) {
-                    Ok(false)
-                } else {
-                    Err(e).context("get_instance_profile")
-                }
-            }
+            Err(e) => match e.into_service_error() {
+                GetInstanceProfileError::NoSuchEntityException(_) => Ok(false),
+                other => Err(anyhow!("get_instance_profile failed: {other}")),
+            },
         }
     }
 
@@ -429,11 +425,6 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// IAM SDK errors don't expose a clean discriminant for "no such entity";
-/// the error type name appears in the Display output.
-fn iam_no_such_entity(message: &str) -> bool {
-    message.contains("NoSuchEntity")
-}
 
 #[cfg(test)]
 mod tests {
@@ -464,14 +455,6 @@ mod tests {
                 "unexpected char {c:?}"
             );
         }
-    }
-
-    #[test]
-    fn iam_no_such_entity_recognizes_the_error() {
-        assert!(iam_no_such_entity("ServiceError(NoSuchEntity: ...)"));
-        assert!(iam_no_such_entity("dispatch failure: NoSuchEntityException"));
-        assert!(!iam_no_such_entity("AccessDenied"));
-        assert!(!iam_no_such_entity(""));
     }
 
     #[test]
