@@ -154,33 +154,41 @@ impl BastionProvisioner for AwsBastionProvisioner {
     }
 
     fn ensure_security_group(&mut self, plan: &SecurityGroupPlan) -> Result<String> {
+        use aws_sdk_ec2::error::ProvideErrorMetadata;
+
         self.block(async {
-            if let Some(existing) = self.find_security_group_by_name(&plan.name).await? {
-                return Ok(existing);
-            }
-            // Need a VPC; use the ALB's SG VPC since the only ingress rule
-            // sources from it.
-            let alb_sg = plan
-                .ingress
-                .iter()
-                .find_map(|r| match &r.source {
-                    IngressSource::SecurityGroup(id) => Some(id.clone()),
-                    IngressSource::Cidr(_) => None,
-                })
-                .ok_or_else(|| anyhow!("plan has no SG-source ingress to derive VPC from"))?;
-            let vpc_id = self.vpc_id_for_security_group(&alb_sg).await?;
-            let create = self
-                .ec2
-                .create_security_group()
-                .group_name(plan.name.clone())
-                .description(plan.description.clone())
-                .vpc_id(vpc_id)
-                .send()
-                .await
-                .context("create_security_group")?;
-            let sg_id = create
-                .group_id
-                .ok_or_else(|| anyhow!("create_security_group returned no GroupId"))?;
+            // Look up first; create only if missing. Either way we then
+            // reconcile ingress rules so a partially-created SG from a
+            // prior failed run gets brought up to spec.
+            let sg_id = match self.find_security_group_by_name(&plan.name).await? {
+                Some(existing) => existing,
+                None => {
+                    let alb_sg = plan
+                        .ingress
+                        .iter()
+                        .find_map(|r| match &r.source {
+                            IngressSource::SecurityGroup(id) => Some(id.clone()),
+                            IngressSource::Cidr(_) => None,
+                        })
+                        .ok_or_else(|| {
+                            anyhow!("plan has no SG-source ingress to derive VPC from")
+                        })?;
+                    let vpc_id = self.vpc_id_for_security_group(&alb_sg).await?;
+                    let create = self
+                        .ec2
+                        .create_security_group()
+                        .group_name(plan.name.clone())
+                        .description(plan.description.clone())
+                        .vpc_id(vpc_id)
+                        .send()
+                        .await
+                        .context("create_security_group")?;
+                    create
+                        .group_id
+                        .ok_or_else(|| anyhow!("create_security_group returned no GroupId"))?
+                }
+            };
+
             for rule in &plan.ingress {
                 let mut perm = IpPermission::builder()
                     .ip_protocol(rule.protocol)
@@ -194,13 +202,21 @@ impl BastionProvisioner for AwsBastionProvisioner {
                             .build(),
                     );
                 }
-                self.ec2
+                let result = self
+                    .ec2
                     .authorize_security_group_ingress()
                     .group_id(&sg_id)
                     .ip_permissions(perm.build())
                     .send()
-                    .await
-                    .context("authorize_security_group_ingress")?;
+                    .await;
+                if let Err(e) = result {
+                    let svc = e.into_service_error();
+                    if svc.code() == Some("InvalidPermission.Duplicate") {
+                        // Rule already present from a prior run — fine.
+                    } else {
+                        return Err(anyhow!("authorize_security_group_ingress failed: {svc}"));
+                    }
+                }
             }
             Ok(sg_id)
         })

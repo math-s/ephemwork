@@ -115,7 +115,9 @@ pub fn security_group_plan(
             from_port: 80,
             to_port: 80,
             source: IngressSource::SecurityGroup(alb_security_group_id.into()),
-            description: "ALB -> bastion nginx",
+            // AWS only allows ASCII `a-zA-Z0-9. _-:/()#,@[]+=&;{}!$*` in
+            // SG rule descriptions, so no `->`.
+            description: "ALB to bastion nginx",
         }],
     })
 }
