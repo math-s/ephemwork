@@ -39,6 +39,14 @@ pub struct ServiceConfig {
     pub build_command: Option<String>,
     pub run_command: String,
     pub health_check_path: Option<String>,
+
+    /// Outbound forwards opened through the bastion via SSM's
+    /// `AWS-StartPortForwardingSessionToRemoteHost` document. Each entry is
+    /// `"local_port:remote_host:remote_port"`. The local service can then
+    /// reach VPC-private services (staging RDS, ElastiCache, internal APIs)
+    /// at `127.0.0.1:<local_port>`.
+    #[serde(default)]
+    pub forward_ports: Vec<String>,
 }
 
 impl Config {

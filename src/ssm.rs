@@ -57,6 +57,20 @@ pub fn pick_free_local_port() -> Result<u16> {
     Ok(port)
 }
 
+/// Inputs for forwarding `localhost:local_port` -> `remote_host:remote_port`
+/// *through* the bastion instance via SSM's
+/// `AWS-StartPortForwardingSessionToRemoteHost` document. Used to give the
+/// laptop outbound reach into VPC-private services like staging RDS without
+/// any SSH involvement (SSM handles multiplexing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHostForwardSpec {
+    pub target: String,
+    pub remote_host: String,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub region: String,
+}
+
 /// Build the `aws ssm start-session` argv for a port forward. Pure function
 /// so tests can pin the wire format without spawning anything.
 pub fn build_start_session_args(spec: &PortForwardSpec, local_port: u16) -> Vec<String> {
@@ -90,6 +104,76 @@ pub fn start_port_forward(spec: &PortForwardSpec) -> Result<SsmTunnel> {
         .spawn()
         .context("spawning `aws ssm start-session` (is the AWS CLI installed?)")?;
     Ok(SsmTunnel::from_child(local_port, child))
+}
+
+/// Build the argv for forwarding through the bastion to a remote host.
+pub fn build_remote_host_session_args(spec: &RemoteHostForwardSpec) -> Vec<String> {
+    vec![
+        "ssm".into(),
+        "start-session".into(),
+        "--region".into(),
+        spec.region.clone(),
+        "--target".into(),
+        spec.target.clone(),
+        "--document-name".into(),
+        "AWS-StartPortForwardingSessionToRemoteHost".into(),
+        "--parameters".into(),
+        format!(
+            "host=[\"{}\"],portNumber=[\"{}\"],localPortNumber=[\"{}\"]",
+            spec.remote_host, spec.remote_port, spec.local_port
+        ),
+    ]
+}
+
+/// Spawn an SSM session that forwards `localhost:local_port` through the
+/// bastion to `remote_host:remote_port`. Drop the returned tunnel to close.
+pub fn start_remote_host_forward(spec: &RemoteHostForwardSpec) -> Result<SsmTunnel> {
+    let args = build_remote_host_session_args(spec);
+    let child = Command::new("aws")
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning `aws ssm start-session` for remote-host forward")?;
+    Ok(SsmTunnel::from_child(spec.local_port, child))
+}
+
+/// Parse `"local:host:port"` as used in `service.<name>.forward_ports`.
+/// Pure so tests can pin the error shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPortSpec {
+    pub local_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
+pub fn parse_forward_port_spec(raw: &str) -> Result<ForwardPortSpec> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() != 3 {
+        return Err(anyhow::anyhow!(
+            "forward_port {raw:?} must have the form 'local:host:remote' (3 parts separated by ':')"
+        ));
+    }
+    let local_port: u16 = parts[0]
+        .parse()
+        .with_context(|| format!("local port in {raw:?}"))?;
+    let remote_host = parts[1].trim().to_string();
+    if remote_host.is_empty() {
+        return Err(anyhow::anyhow!(
+            "forward_port {raw:?} has empty remote host"
+        ));
+    }
+    let remote_port: u16 = parts[2]
+        .parse()
+        .with_context(|| format!("remote port in {raw:?}"))?;
+    if local_port == 0 || remote_port == 0 {
+        return Err(anyhow::anyhow!("forward_port {raw:?} has port 0"));
+    }
+    Ok(ForwardPortSpec {
+        local_port,
+        remote_host,
+        remote_port,
+    })
 }
 
 #[cfg(test)]
@@ -130,6 +214,66 @@ mod tests {
         let args = build_start_session_args(&s, 1);
         let region_idx = args.iter().position(|s| s == "--region").unwrap();
         assert_eq!(args[region_idx + 1], "sa-east-1");
+    }
+
+    fn remote_spec() -> RemoteHostForwardSpec {
+        RemoteHostForwardSpec {
+            target: "i-bastion".into(),
+            remote_host: "staging-rds.cluster-xxx.us-east-1.rds.amazonaws.com".into(),
+            remote_port: 5432,
+            local_port: 5432,
+            region: "us-east-1".into(),
+        }
+    }
+
+    #[test]
+    fn build_remote_host_args_uses_to_remote_host_document() {
+        let args = build_remote_host_session_args(&remote_spec());
+        let doc_idx = args.iter().position(|s| s == "--document-name").unwrap();
+        assert_eq!(args[doc_idx + 1], "AWS-StartPortForwardingSessionToRemoteHost");
+        let target_idx = args.iter().position(|s| s == "--target").unwrap();
+        assert_eq!(args[target_idx + 1], "i-bastion");
+        let params = args.iter().find(|s| s.contains("host=")).unwrap();
+        assert!(params.contains("host=[\"staging-rds.cluster-xxx.us-east-1.rds.amazonaws.com\"]"), "got: {params}");
+        assert!(params.contains("portNumber=[\"5432\"]"), "got: {params}");
+        assert!(params.contains("localPortNumber=[\"5432\"]"), "got: {params}");
+    }
+
+    #[test]
+    fn parse_forward_port_spec_round_trips_a_typical_value() {
+        let s = parse_forward_port_spec("5432:rds.example.com:5432").unwrap();
+        assert_eq!(s.local_port, 5432);
+        assert_eq!(s.remote_host, "rds.example.com");
+        assert_eq!(s.remote_port, 5432);
+    }
+
+    #[test]
+    fn parse_forward_port_spec_supports_distinct_local_remote_ports() {
+        let s = parse_forward_port_spec("15432:rds.example.com:5432").unwrap();
+        assert_eq!(s.local_port, 15432);
+        assert_eq!(s.remote_port, 5432);
+    }
+
+    #[test]
+    fn parse_forward_port_spec_rejects_too_few_parts() {
+        let err = parse_forward_port_spec("5432:rds").unwrap_err().to_string();
+        assert!(err.contains("3 parts"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_forward_port_spec_rejects_empty_host() {
+        assert!(parse_forward_port_spec("5432::5432").is_err());
+    }
+
+    #[test]
+    fn parse_forward_port_spec_rejects_zero_port() {
+        assert!(parse_forward_port_spec("0:rds:5432").is_err());
+        assert!(parse_forward_port_spec("5432:rds:0").is_err());
+    }
+
+    #[test]
+    fn parse_forward_port_spec_rejects_garbage_port() {
+        assert!(parse_forward_port_spec("abc:rds:5432").is_err());
     }
 
     #[test]
