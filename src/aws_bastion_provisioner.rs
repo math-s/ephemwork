@@ -12,8 +12,8 @@
 //! end-to-end via a manual smoke test against a real account.
 
 use crate::bastion_provisioner::{
-    assume_role_policy_document, managed_policy_arns, BastionProvisioner, IngressSource,
-    InstanceSummary, LaunchPlan, SecurityGroupPlan, IAM_INSTANCE_PROFILE_NAME, IAM_ROLE_NAME,
+    assume_role_policy_document, managed_policy_arns, BastionContext, BastionProvisioner,
+    IngressSource, InstanceSummary, LaunchPlan, SecurityGroupPlan,
 };
 use anyhow::{anyhow, Context, Result};
 use aws_sdk_ec2::types::{
@@ -29,10 +29,11 @@ pub struct AwsBastionProvisioner {
     ec2: Ec2Client,
     iam: IamClient,
     handle: Handle,
+    ctx: BastionContext,
 }
 
 impl AwsBastionProvisioner {
-    pub async fn new(region: String) -> Result<Self> {
+    pub async fn new(region: String, ctx: BastionContext) -> Result<Self> {
         let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region))
             .load()
@@ -41,6 +42,7 @@ impl AwsBastionProvisioner {
             ec2: Ec2Client::new(&cfg),
             iam: IamClient::new(&cfg),
             handle: Handle::current(),
+            ctx,
         })
     }
 
@@ -115,10 +117,10 @@ impl AwsBastionProvisioner {
 impl BastionProvisioner for AwsBastionProvisioner {
     fn ensure_iam_role(&mut self) -> Result<()> {
         self.block(async {
-            if !self.iam_role_exists(IAM_ROLE_NAME).await? {
+            if !self.iam_role_exists(self.ctx.iam_role_name().as_str()).await? {
                 self.iam
                     .create_role()
-                    .role_name(IAM_ROLE_NAME)
+                    .role_name(self.ctx.iam_role_name().as_str())
                     .assume_role_policy_document(assume_role_policy_document())
                     .send()
                     .await
@@ -127,26 +129,26 @@ impl BastionProvisioner for AwsBastionProvisioner {
             for arn in managed_policy_arns() {
                 self.iam
                     .attach_role_policy()
-                    .role_name(IAM_ROLE_NAME)
+                    .role_name(self.ctx.iam_role_name().as_str())
                     .policy_arn(arn)
                     .send()
                     .await
                     .with_context(|| format!("attach_role_policy {arn}"))?;
             }
             if !self
-                .instance_profile_exists(IAM_INSTANCE_PROFILE_NAME)
+                .instance_profile_exists(self.ctx.iam_instance_profile_name().as_str())
                 .await?
             {
                 self.iam
                     .create_instance_profile()
-                    .instance_profile_name(IAM_INSTANCE_PROFILE_NAME)
+                    .instance_profile_name(self.ctx.iam_instance_profile_name().as_str())
                     .send()
                     .await
                     .context("create_instance_profile")?;
                 self.iam
                     .add_role_to_instance_profile()
-                    .instance_profile_name(IAM_INSTANCE_PROFILE_NAME)
-                    .role_name(IAM_ROLE_NAME)
+                    .instance_profile_name(self.ctx.iam_instance_profile_name().as_str())
+                    .role_name(self.ctx.iam_role_name().as_str())
                     .send()
                     .await
                     .context("add_role_to_instance_profile")?;
@@ -351,36 +353,36 @@ impl BastionProvisioner for AwsBastionProvisioner {
             // Reverse of ensure_iam_role: detach policies, remove from
             // instance profile, delete profile, delete role.
             if self
-                .instance_profile_exists(IAM_INSTANCE_PROFILE_NAME)
+                .instance_profile_exists(self.ctx.iam_instance_profile_name().as_str())
                 .await?
             {
                 let _ = self
                     .iam
                     .remove_role_from_instance_profile()
-                    .instance_profile_name(IAM_INSTANCE_PROFILE_NAME)
-                    .role_name(IAM_ROLE_NAME)
+                    .instance_profile_name(self.ctx.iam_instance_profile_name().as_str())
+                    .role_name(self.ctx.iam_role_name().as_str())
                     .send()
                     .await;
                 self.iam
                     .delete_instance_profile()
-                    .instance_profile_name(IAM_INSTANCE_PROFILE_NAME)
+                    .instance_profile_name(self.ctx.iam_instance_profile_name().as_str())
                     .send()
                     .await
                     .context("delete_instance_profile")?;
             }
-            if self.iam_role_exists(IAM_ROLE_NAME).await? {
+            if self.iam_role_exists(self.ctx.iam_role_name().as_str()).await? {
                 for arn in managed_policy_arns() {
                     let _ = self
                         .iam
                         .detach_role_policy()
-                        .role_name(IAM_ROLE_NAME)
+                        .role_name(self.ctx.iam_role_name().as_str())
                         .policy_arn(arn)
                         .send()
                         .await;
                 }
                 self.iam
                     .delete_role()
-                    .role_name(IAM_ROLE_NAME)
+                    .role_name(self.ctx.iam_role_name().as_str())
                     .send()
                     .await
                     .context("delete_role")?;

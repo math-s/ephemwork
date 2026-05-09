@@ -9,7 +9,7 @@
 use crate::aws_bastion_provisioner::AwsBastionProvisioner;
 use crate::bastion_client::{self, BastionEndpoint};
 use crate::bastion_protocol::{DeregisterRequest, RegisterRequest};
-use crate::bastion_provisioner::{BastionProvisioner, InstanceSummary, BASTION_NAME};
+use crate::bastion_provisioner::{BastionContext, BastionProvisioner, InstanceSummary};
 use crate::config::{current_user, Config};
 use crate::runner::{spawn_service, wait_for_health, HealthCheck, RunningService};
 use crate::ssm::{start_port_forward, PortForwardSpec, SsmTunnel};
@@ -253,9 +253,10 @@ impl ActiveSession {
 /// Launch the local service and bridge it to the bastion. The function blocks
 /// nothing on its own; the caller (typically main) decides whether to keep
 /// the returned `ActiveSession` alive (foreground UX) or hand it off.
-pub async fn up_service(req: UpRequest) -> Result<ActiveSession> {
-    let mut provisioner = AwsBastionProvisioner::new(req.region.clone()).await?;
-    let bastion = locate_bastion(&mut provisioner)?;
+pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession> {
+    let mut provisioner =
+        AwsBastionProvisioner::new(req.region.clone(), ctx.clone()).await?;
+    let bastion = locate_bastion(&mut provisioner, &ctx)?;
 
     // Open SSM port-forward to the bastion control plane.
     let cp_ssm = start_port_forward(&PortForwardSpec {
@@ -337,12 +338,16 @@ pub async fn up_service(req: UpRequest) -> Result<ActiveSession> {
     })
 }
 
-fn locate_bastion(provisioner: &mut dyn BastionProvisioner) -> Result<InstanceSummary> {
+fn locate_bastion(
+    provisioner: &mut dyn BastionProvisioner,
+    ctx: &BastionContext,
+) -> Result<InstanceSummary> {
+    let name = ctx.instance_name();
     provisioner
-        .find_instance_by_name(BASTION_NAME)?
+        .find_instance_by_name(&name)?
         .ok_or_else(|| {
             anyhow!(
-                "no bastion found (no instance tagged Name={BASTION_NAME}). Run \
+                "no bastion found (no instance tagged Name={name}). Run \
                  `ephemwork bastion init --live ...` to provision one."
             )
         })
@@ -377,6 +382,7 @@ fn wait_for_local_port(port: u16, timeout: Duration) -> Result<()> {
 pub async fn down_service(service: Option<String>) -> Result<Vec<Session>> {
     let user = current_user()?;
     let cfg = Config::load()?;
+    let ctx = BastionContext::new(cfg.tunnel.project_name.clone());
     let state_path = default_state_path()?;
     let state = State::load(&state_path)?;
     let candidates: Vec<Session> = state
@@ -389,10 +395,7 @@ pub async fn down_service(service: Option<String>) -> Result<Vec<Session>> {
         return Ok(Vec::new());
     }
 
-    // Best-effort bastion deregistration through a fresh SSM tunnel. If the
-    // bastion is unreachable we still clear local state because the laptop
-    // can't drive what it can't reach.
-    if let Err(e) = deregister_via_bastion(&cfg, &user, &candidates).await {
+    if let Err(e) = deregister_via_bastion(&cfg, &ctx, &user, &candidates).await {
         tracing::warn!(?e, "bastion deregistration failed; clearing local state anyway");
     }
 
@@ -402,9 +405,15 @@ pub async fn down_service(service: Option<String>) -> Result<Vec<Session>> {
     Ok(removed)
 }
 
-async fn deregister_via_bastion(cfg: &Config, user: &str, sessions: &[Session]) -> Result<()> {
-    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
-    let bastion = match provisioner.find_instance_by_name(BASTION_NAME)? {
+async fn deregister_via_bastion(
+    cfg: &Config,
+    ctx: &BastionContext,
+    user: &str,
+    sessions: &[Session],
+) -> Result<()> {
+    let mut provisioner =
+        AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+    let bastion = match provisioner.find_instance_by_name(&ctx.instance_name())? {
         Some(b) => b,
         None => return Ok(()),
     };
@@ -446,6 +455,7 @@ mod tests {
                 r#type: "ec2".into(),
                 region: "us-east-1".into(),
                 instance_type: "t4g.nano".into(),
+                project_name: "demo".into(),
             },
             service,
         }
