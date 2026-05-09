@@ -18,9 +18,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::handlers::{route, MutationListener, NoopListener};
 use crate::http::{read_request, write_response};
+use crate::nginx::{NginxReloader, ReloadCommand};
 use crate::registry::{default_registry_path, Registry};
 
 const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8443);
+const DEFAULT_NGINX_CONFIG: &str = "/etc/nginx/conf.d/ephemwork.conf";
+
+/// Inputs the connection handler needs that don't change across requests.
+#[derive(Clone)]
+struct ServerConfig {
+    persist_path: PathBuf,
+    nginx_config: PathBuf,
+    nginx_reload: ReloadCommand,
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
@@ -29,27 +39,53 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_BIND);
     let registry_path = default_registry_path();
+    let nginx_config = std::env::var("EPHEMWORK_NGINX_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_NGINX_CONFIG));
+    let nginx_reload = match std::env::var("EPHEMWORK_NGINX_RELOAD") {
+        Ok(cmd) if !cmd.trim().is_empty() => ReloadCommand::Custom(cmd),
+        _ => ReloadCommand::None,
+    };
+
     let registry = Registry::load(&registry_path)
         .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+
+    let cfg = ServerConfig {
+        persist_path: registry_path.clone(),
+        nginx_config: nginx_config.clone(),
+        nginx_reload: nginx_reload.clone(),
+    };
+
     tracing::info!(
         bind = %addr,
         registry = %registry_path.display(),
+        nginx_config = %nginx_config.display(),
+        nginx_reload = ?nginx_reload,
         sessions = registry.len(),
         "bastion control plane starting"
     );
-    serve(addr, Arc::new(Mutex::new(registry)), registry_path)
+
+    // On startup, if there are existing sessions, render nginx so the active
+    // map is correct after a control-plane restart. With no sessions, the
+    // user-data stub remains until the first /register fires.
+    if !registry.is_empty() {
+        let mut listener = composite_listener(&cfg);
+        listener.on_change(&registry);
+    }
+
+    serve(addr, Arc::new(Mutex::new(registry)), cfg)
 }
 
 /// Run the accept loop. Splitting it out lets integration tests drive the
 /// server with arbitrary registries and listeners.
-pub fn serve(addr: SocketAddr, registry: Arc<Mutex<Registry>>, persist_path: PathBuf) -> Result<()> {
+fn serve(addr: SocketAddr, registry: Arc<Mutex<Registry>>, cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     loop {
         let (stream, _peer) = listener.accept().context("accept")?;
         let registry_clone = registry.clone();
-        let persist_path_clone = persist_path.clone();
+        let cfg_clone = cfg.clone();
         std::thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, registry_clone, persist_path_clone) {
+            if let Err(e) = handle_connection(stream, registry_clone, cfg_clone) {
                 tracing::warn!(?e, "connection handler failed");
             }
         });
@@ -59,16 +95,39 @@ pub fn serve(addr: SocketAddr, registry: Arc<Mutex<Registry>>, persist_path: Pat
 fn handle_connection(
     mut stream: TcpStream,
     registry: Arc<Mutex<Registry>>,
-    persist_path: PathBuf,
+    cfg: ServerConfig,
 ) -> Result<()> {
     let request = read_request(&mut stream)?;
-    let mut listener = PersistOnChange::new(persist_path);
+    let mut listener = composite_listener(&cfg);
     let response = {
         let mut reg = registry.lock().expect("registry mutex poisoned");
         route(&request, &mut reg, &mut listener)
     };
     write_response(&mut stream, &response)?;
     Ok(())
+}
+
+fn composite_listener(cfg: &ServerConfig) -> CompositeListener {
+    CompositeListener {
+        persist: PersistOnChange::new(cfg.persist_path.clone()),
+        nginx: NginxReloader::new(cfg.nginx_config.clone(), cfg.nginx_reload.clone()),
+    }
+}
+
+/// Fans `on_change` out to every listener. Order: persist first (cheap, makes
+/// crash recovery correct) then nginx (slower, may shell out). If persist
+/// fails the next call will retry; if nginx fails the new mapping is not yet
+/// live, but the registry is still consistent on disk.
+struct CompositeListener {
+    persist: PersistOnChange,
+    nginx: NginxReloader,
+}
+
+impl MutationListener for CompositeListener {
+    fn on_change(&mut self, registry: &Registry) {
+        self.persist.on_change(registry);
+        self.nginx.on_change(registry);
+    }
 }
 
 /// `MutationListener` that snapshots the registry to disk after every change.
@@ -111,8 +170,15 @@ mod tests {
     fn start_test_server() -> (SocketAddr, std::path::PathBuf, std::thread::JoinHandle<()>) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("registry.json");
+        let nginx_path = dir.path().join("nginx.conf");
         // Leak the tempdir so it lives for the duration of the test thread.
         std::mem::forget(dir);
+
+        let cfg = ServerConfig {
+            persist_path: path.clone(),
+            nginx_config: nginx_path,
+            nginx_reload: ReloadCommand::None,
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -120,15 +186,15 @@ mod tests {
             start: 10_000,
             end: 10_010,
         })));
-        let persist_path = path.clone();
+        let cfg_clone = cfg.clone();
         let handle = std::thread::spawn(move || {
             // Single-shot accept loop: handle a couple of connections then exit.
             for _ in 0..3 {
                 if let Ok((stream, _)) = listener.accept() {
                     let r = registry.clone();
-                    let p = persist_path.clone();
+                    let c = cfg_clone.clone();
                     std::thread::spawn(move || {
-                        let _ = handle_connection(stream, r, p);
+                        let _ = handle_connection(stream, r, c);
                     });
                 }
             }
@@ -162,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_register_then_persist() {
+    fn end_to_end_register_then_persist_and_render_nginx() {
         let (addr, path, _) = start_test_server();
 
         let body = serde_json::to_vec(&RegisterRequest {
@@ -177,8 +243,18 @@ mod tests {
 
         // Persistence check: load the file we configured the listener to write to.
         // Give the persistence thread a moment to flush.
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(150));
         let reloaded = Registry::load(&path).unwrap();
         assert_eq!(reloaded.len(), 1);
+
+        // Nginx-render check: the test ServerConfig points at a file in the
+        // same temp dir as the registry, so rendering produces it alongside.
+        let nginx_path = path
+            .parent()
+            .unwrap()
+            .join("nginx.conf");
+        let rendered = std::fs::read_to_string(&nginx_path).expect("nginx config rendered");
+        assert!(rendered.contains("matheus:api"), "rendered config should map the registered key, got:\n{rendered}");
+        assert!(rendered.contains("127.0.0.1:10000"), "rendered config should target the allocated port:\n{rendered}");
     }
 }
