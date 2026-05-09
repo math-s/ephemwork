@@ -226,12 +226,18 @@ pub fn open_ssh2_reverse_forward(
         return Err(anyhow!("ssh authentication failed"));
     }
     sess.set_keepalive(true, cfg.keepalive.as_secs() as u32);
-    // Non-blocking so bridge_bidirectional can poll the channel.
-    sess.set_blocking(false);
 
+    // Request the remote-side listener while the session is still blocking
+    // — channel_forward_listen on a non-blocking session returns EAGAIN
+    // (LIBSSH2_ERROR_EAGAIN, code -37) instead of completing, which
+    // surfaced as `Error: requesting remote port forward / Would block`.
     let (listener, _bound) = sess
         .channel_forward_listen(remote_port, Some(&cfg.host), None)
         .context("requesting remote port forward")?;
+
+    // Now flip to non-blocking so bridge_bidirectional can poll the
+    // accepted channels without parking the worker thread.
+    sess.set_blocking(false);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
