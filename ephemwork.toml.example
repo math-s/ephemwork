@@ -7,6 +7,12 @@ type = "ec2"
 region = "us-east-1"
 instance_type = "t4g.nano"
 
+# Optional but strongly recommended: pin the staging VPC ID. If set,
+# `bastion init --live` looks up the supplied --subnet-id first and
+# refuses to provision when the subnet's VPC differs. Cheap insurance
+# against accidentally creating a bastion in prod.
+# expected_vpc_id = "vpc-0123456789abcdef0"
+
 [service.backend]
 port = 8080
 build_command = "cargo build"

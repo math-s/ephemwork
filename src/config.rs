@@ -24,6 +24,13 @@ pub struct TunnelConfig {
     /// same AWS account never collide and re-running `bastion init` is
     /// idempotent (the existing instance is reused).
     pub project_name: String,
+
+    /// If set, `bastion init --live` looks up the supplied `--subnet-id`
+    /// before creating anything and aborts when the subnet's VPC doesn't
+    /// match. Pin this to the staging VPC ID so a misfired init with prod
+    /// values cannot accidentally provision a bastion in prod.
+    #[serde(default)]
+    pub expected_vpc_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -178,6 +185,27 @@ run_command = "npm run dev"
         assert_eq!(cfg.service["api"].health_check_path.as_deref(), Some("/health"));
         assert_eq!(cfg.service["front-end"].build_command.as_deref(), Some("npm install"));
         assert!(cfg.service["front-end"].health_check_path.is_none());
+        // expected_vpc_id is optional; the minimal config doesn't set it.
+        assert!(cfg.tunnel.expected_vpc_id.is_none());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_optional_expected_vpc_id() {
+        let toml = r#"
+[tunnel]
+type = "ec2"
+region = "us-east-1"
+instance_type = "t4g.nano"
+project_name = "demo"
+expected_vpc_id = "vpc-0123abc"
+
+[service.api]
+port = 8000
+run_command = "x"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.tunnel.expected_vpc_id.as_deref(), Some("vpc-0123abc"));
         cfg.validate().unwrap();
     }
 

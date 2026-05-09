@@ -1,4 +1,4 @@
-use ephemwork::aws_bastion_provisioner::AwsBastionProvisioner;
+use ephemwork::aws_bastion_provisioner::{verify_vpc_match, AwsBastionProvisioner};
 use ephemwork::bastion_provisioner::{
     render_bastion_status, run_destroy, run_init, run_status as run_bastion_status,
     security_group_plan, BastionContext, LaunchPlan, PlanLogger,
@@ -111,6 +111,14 @@ async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
 
     let mut provisioner =
         AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+
+    // Prod-safety guard: if the toml pins expected_vpc_id, abort before
+    // creating anything when the supplied subnet is in a different VPC.
+    if let Some(expected_vpc) = cfg.tunnel.expected_vpc_id.as_deref() {
+        let actual_vpc = provisioner.vpc_id_for_subnet(&args.subnet_id).await?;
+        verify_vpc_match(&args.subnet_id, &actual_vpc, expected_vpc)?;
+    }
+
     let outcome = run_init(&mut provisioner, &ctx, &sg_plan, build_launch_plan)?;
     let verb = if outcome.reused {
         "already provisioned"

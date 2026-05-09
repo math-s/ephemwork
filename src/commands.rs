@@ -456,6 +456,7 @@ mod tests {
                 region: "us-east-1".into(),
                 instance_type: "t4g.nano".into(),
                 project_name: "demo".into(),
+                expected_vpc_id: None,
             },
             service,
         }
