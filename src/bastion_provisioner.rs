@@ -171,7 +171,12 @@ Restart=always
 RestartSec=2
 Environment=EPHEMWORK_REGISTRY_PATH=/var/lib/ephemwork/registry.json
 Environment=EPHEMWORK_NGINX_CONFIG=/etc/nginx/conf.d/ephemwork.conf
-Environment=EPHEMWORK_NGINX_RELOAD=systemctl reload nginx
+# Quote the entire KEY=VALUE so systemd treats the multi-word
+# command as ONE env var. Without quotes, `systemctl reload nginx`
+# is parsed as three separate `Key=Value` tokens, the bastion-server
+# only sees `EPHEMWORK_NGINX_RELOAD=systemctl`, and nginx is never
+# actually reloaded after a /register.
+Environment="EPHEMWORK_NGINX_RELOAD=systemctl reload nginx"
 Environment=RUST_LOG=info
 
 [Install]
