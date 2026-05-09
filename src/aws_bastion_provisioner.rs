@@ -50,6 +50,23 @@ impl AwsBastionProvisioner {
         block_in_place(|| self.handle.block_on(fut))
     }
 
+    /// Look up which VPC the subnet lives in. Used by the prod-safety guard
+    /// in `bastion init --live` to refuse a subnet from the wrong VPC before
+    /// any resource is created.
+    pub async fn vpc_id_for_subnet(&self, subnet_id: &str) -> Result<String> {
+        let resp = self
+            .ec2
+            .describe_subnets()
+            .subnet_ids(subnet_id)
+            .send()
+            .await
+            .with_context(|| format!("describe_subnets {subnet_id}"))?;
+        resp.subnets
+            .and_then(|v| v.into_iter().next())
+            .and_then(|s| s.vpc_id)
+            .ok_or_else(|| anyhow!("subnet {subnet_id} not found"))
+    }
+
     async fn iam_role_exists(&self, name: &str) -> Result<bool> {
         use aws_sdk_iam::operation::get_role::GetRoleError;
         match self.iam.get_role().role_name(name).send().await {
@@ -415,6 +432,19 @@ fn build_tag_spec(tags: &[(String, String)]) -> TagSpecification {
         .build()
 }
 
+/// Pure check for the prod-safety guard. Public so tests can pin the error
+/// shape without making any AWS calls.
+pub fn verify_vpc_match(subnet_id: &str, actual_vpc: &str, expected_vpc: &str) -> Result<()> {
+    if actual_vpc != expected_vpc {
+        return Err(anyhow!(
+            "refusing to provision: subnet {subnet_id} is in {actual_vpc} but \
+             ephemwork.toml pins tunnel.expected_vpc_id = {expected_vpc}. Aborting \
+             before any AWS resource is created."
+        ));
+    }
+    Ok(())
+}
+
 /// Minimal base64 encoder. AWS expects `user_data` to be base64-encoded;
 /// we'd rather not pull in the `base64` crate just for this.
 pub fn base64_encode(input: &[u8]) -> String {
@@ -471,6 +501,22 @@ mod tests {
                 "unexpected char {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn verify_vpc_match_accepts_same_vpc() {
+        verify_vpc_match("subnet-x", "vpc-1", "vpc-1").unwrap();
+    }
+
+    #[test]
+    fn verify_vpc_match_rejects_different_vpc_with_explicit_message() {
+        let err = verify_vpc_match("subnet-prod", "vpc-prod", "vpc-staging")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("subnet-prod"), "got: {err}");
+        assert!(err.contains("vpc-prod"), "got: {err}");
+        assert!(err.contains("vpc-staging"), "got: {err}");
+        assert!(err.contains("expected_vpc_id"), "got: {err}");
     }
 
     #[test]
