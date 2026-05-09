@@ -1,9 +1,11 @@
 use ephemwork::aws_bastion_provisioner::AwsBastionProvisioner;
 use ephemwork::bastion_provisioner::{
     render_bastion_status, run_destroy, run_init, run_status as run_bastion_status,
-    security_group_plan, LaunchPlan, PlanLogger,
+    security_group_plan, BastionContext, LaunchPlan, PlanLogger,
 };
-use ephemwork::cli::{BastionCommand, BastionDestroyArgs, BastionInitArgs, Cli, Command, UpArgs, DownArgs};
+use ephemwork::cli::{
+    BastionCommand, BastionDestroyArgs, BastionInitArgs, Cli, Command, DownArgs, UpArgs,
+};
 use ephemwork::commands::{
     down_service, render_status, status as run_status, up_service, UpRequest,
 };
@@ -32,11 +34,16 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ctx_from_config(cfg: &Config) -> BastionContext {
+    BastionContext::new(cfg.tunnel.project_name.clone())
+}
+
 async fn up(args: UpArgs) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let user = current_user()?;
+    let ctx = ctx_from_config(&cfg);
     let req = UpRequest::from_config(&cfg, &args.service, &user)?;
-    let session = up_service(req).await?;
+    let session = up_service(req, ctx).await?;
 
     println!();
     println!("✓ {} is live.", session.service);
@@ -44,7 +51,10 @@ async fn up(args: UpArgs) -> anyhow::Result<()> {
     println!();
     println!("    {}", session.header_line());
     println!();
-    println!("  pid={}  local:{}  bastion-port:{}", session.pid, session.local_port, session.remote_port);
+    println!(
+        "  pid={}  local:{}  bastion-port:{}",
+        session.pid, session.local_port, session.remote_port
+    );
     println!();
     println!("Press Ctrl-C to stop.");
 
@@ -64,7 +74,10 @@ async fn down(args: DownArgs) -> anyhow::Result<()> {
         }
     } else {
         for s in &removed {
-            println!("cleaned up {} (was bastion-port {})", s.service, s.remote_port);
+            println!(
+                "cleaned up {} (was bastion-port {})",
+                s.service, s.remote_port
+            );
         }
     }
     Ok(())
@@ -72,19 +85,23 @@ async fn down(args: DownArgs) -> anyhow::Result<()> {
 
 async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
     let cfg = Config::load()?;
-    let sg_plan = security_group_plan(&args.alb_security_group_id)?;
+    let ctx = ctx_from_config(&cfg);
+    let sg_plan = security_group_plan(&ctx, &args.alb_security_group_id)?;
+
+    let build_launch_plan = |sg_id: &str| {
+        LaunchPlan::from_config(
+            &cfg.tunnel,
+            &ctx,
+            &args.ami_id,
+            &args.subnet_id,
+            sg_id,
+            &args.bastion_binary_s3_uri,
+        )
+    };
 
     if !args.live {
-        let mut logger = PlanLogger::new();
-        run_init(&mut logger, &sg_plan, |sg_id| {
-            LaunchPlan::from_config(
-                &cfg.tunnel,
-                &args.ami_id,
-                &args.subnet_id,
-                sg_id,
-                &args.bastion_binary_s3_uri,
-            )
-        })?;
+        let mut logger = PlanLogger::new(ctx.clone());
+        run_init(&mut logger, &ctx, &sg_plan, build_launch_plan)?;
         println!("Dry run (no AWS calls). Re-run with --live to provision.");
         for line in &logger.log {
             println!("  {line}");
@@ -92,28 +109,36 @@ async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
-    let outcome = run_init(&mut provisioner, &sg_plan, |sg_id| {
-        LaunchPlan::from_config(
-            &cfg.tunnel,
-            &args.ami_id,
-            &args.subnet_id,
-            sg_id,
-            &args.bastion_binary_s3_uri,
-        )
-    })?;
+    let mut provisioner =
+        AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+    let outcome = run_init(&mut provisioner, &ctx, &sg_plan, build_launch_plan)?;
+    let verb = if outcome.reused {
+        "already provisioned"
+    } else {
+        "provisioned"
+    };
     println!(
-        "bastion provisioned: instance={} security_group={}",
+        "bastion {verb}: instance={} security_group={}",
         outcome.instance_id, outcome.security_group_id
     );
-    println!("next: add the ALB listener rule documented in README.md, then `ephemwork up <service>`.");
+    if !outcome.reused {
+        println!(
+            "next: add the ALB listener rule documented in README.md, then \
+             `ephemwork up <service>`."
+        );
+    }
     Ok(())
 }
 
 async fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let ctx = ctx_from_config(&cfg);
+
     if !args.live {
-        let mut logger = PlanLogger::new();
-        let outcome = run_destroy(&mut logger)?;
+        let mut logger = PlanLogger::new(ctx.clone());
+        // Show the destroy path with a synthetic existing instance.
+        logger.pretend_existing = true;
+        let outcome = run_destroy(&mut logger, &ctx)?;
         println!("Dry run (no AWS calls). Re-run with --live to delete.");
         for line in &logger.log {
             println!("  {line}");
@@ -124,9 +149,9 @@ async fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cfg = Config::load()?;
-    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
-    let outcome = run_destroy(&mut provisioner)?;
+    let mut provisioner =
+        AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+    let outcome = run_destroy(&mut provisioner, &ctx)?;
     match outcome.instance_id {
         Some(id) => println!("terminated {id}; security group + IAM role removed."),
         None => println!("nothing to do (no bastion instance found)."),
@@ -136,8 +161,10 @@ async fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
 
 async fn bastion_status() -> anyhow::Result<()> {
     let cfg = Config::load()?;
-    let mut provisioner = AwsBastionProvisioner::new(cfg.tunnel.region.clone()).await?;
-    let status = run_bastion_status(&mut provisioner)?;
-    println!("{}", render_bastion_status(&status));
+    let ctx = ctx_from_config(&cfg);
+    let mut provisioner =
+        AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+    let status = run_bastion_status(&mut provisioner, &ctx)?;
+    println!("{}", render_bastion_status(&status, &ctx));
     Ok(())
 }

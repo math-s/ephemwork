@@ -19,6 +19,11 @@ pub struct TunnelConfig {
     pub r#type: String,
     pub region: String,
     pub instance_type: String,
+    /// Project identifier. All bastion AWS resources are named
+    /// `ephemwork-{project_name}-bastion[-suffix]` so two projects in the
+    /// same AWS account never collide and re-running `bastion init` is
+    /// idempotent (the existing instance is reused).
+    pub project_name: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -53,6 +58,20 @@ impl Config {
         }
         if self.tunnel.instance_type.trim().is_empty() {
             return Err(anyhow!("tunnel.instance_type must not be empty"));
+        }
+        if self.tunnel.project_name.trim().is_empty() {
+            return Err(anyhow!("tunnel.project_name must not be empty"));
+        }
+        if !self
+            .tunnel
+            .project_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(anyhow!(
+                "tunnel.project_name must be ASCII alnum + `-_` (got {:?})",
+                self.tunnel.project_name
+            ));
         }
         if self.service.is_empty() {
             return Err(anyhow!(
@@ -136,6 +155,7 @@ mod tests {
 type = "ec2"
 region = "us-east-1"
 instance_type = "t4g.nano"
+project_name = "demo"
 
 [service.api]
 port = 8000
@@ -168,6 +188,7 @@ run_command = "npm run dev"
 type = "ec2"
 region = "us-east-1"
 instance_type = "t4g.nano"
+project_name = "demo"
 "#;
         let cfg = Config::from_toml_str(toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
@@ -181,6 +202,7 @@ instance_type = "t4g.nano"
 type = "ec2"
 region = "us-east-1"
 instance_type = "t4g.nano"
+project_name = "demo"
 
 [service.api]
 port = 0
@@ -198,6 +220,7 @@ run_command = "x"
 type = "ec2"
 region = "us-east-1"
 instance_type = "t4g.nano"
+project_name = "demo"
 
 [service.api]
 port = 8000
@@ -215,6 +238,7 @@ run_command = "   "
 type = ""
 region = "us-east-1"
 instance_type = "t4g.nano"
+project_name = "demo"
 
 [service.api]
 port = 8000
@@ -223,6 +247,40 @@ run_command = "x"
         let cfg = Config::from_toml_str(toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("tunnel.type"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_missing_project_name() {
+        // project_name is required by the schema; absence fails parsing.
+        let toml = r#"
+[tunnel]
+type = "ec2"
+region = "us-east-1"
+instance_type = "t4g.nano"
+
+[service.api]
+port = 8000
+run_command = "x"
+"#;
+        assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_project_name() {
+        let toml = r#"
+[tunnel]
+type = "ec2"
+region = "us-east-1"
+instance_type = "t4g.nano"
+project_name = "moto cred"
+
+[service.api]
+port = 8000
+run_command = "x"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("project_name"), "got: {err}");
     }
 
     #[test]

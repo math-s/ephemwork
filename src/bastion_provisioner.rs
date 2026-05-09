@@ -14,12 +14,34 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::BTreeMap;
 
-/// Resource names + tags used to look up existing bastion resources so
-/// `bastion init` is idempotent.
-pub const BASTION_NAME: &str = "ephemwork-bastion";
-pub const SECURITY_GROUP_NAME: &str = "ephemwork-bastion-sg";
-pub const IAM_ROLE_NAME: &str = "ephemwork-bastion-role";
-pub const IAM_INSTANCE_PROFILE_NAME: &str = "ephemwork-bastion-instance-profile";
+/// Per-project bastion identity. Resource names are derived from
+/// `project_name` so two projects in the same AWS account never collide,
+/// and lookup-by-name keeps `bastion init` idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BastionContext {
+    pub project_name: String,
+}
+
+impl BastionContext {
+    pub fn new(project_name: impl Into<String>) -> Self {
+        Self {
+            project_name: project_name.into(),
+        }
+    }
+
+    pub fn instance_name(&self) -> String {
+        format!("ephemwork-{}-bastion", self.project_name)
+    }
+    pub fn security_group_name(&self) -> String {
+        format!("ephemwork-{}-bastion-sg", self.project_name)
+    }
+    pub fn iam_role_name(&self) -> String {
+        format!("ephemwork-{}-bastion-role", self.project_name)
+    }
+    pub fn iam_instance_profile_name(&self) -> String {
+        format!("ephemwork-{}-bastion-instance-profile", self.project_name)
+    }
+}
 
 /// IAM trust policy that lets EC2 assume the bastion role. Returned as a
 /// canonical JSON string so it round-trips identically through AWS.
@@ -75,13 +97,19 @@ pub enum IngressSource {
 /// Build the plan for the bastion's security group given the staging ALB's
 /// security group ID. We lock the only public-facing port (80) to traffic
 /// coming from the ALB; all other access is via SSM.
-pub fn security_group_plan(alb_security_group_id: &str) -> Result<SecurityGroupPlan> {
+pub fn security_group_plan(
+    ctx: &BastionContext,
+    alb_security_group_id: &str,
+) -> Result<SecurityGroupPlan> {
     if alb_security_group_id.trim().is_empty() {
         return Err(anyhow!("alb_security_group_id must not be empty"));
     }
     Ok(SecurityGroupPlan {
-        name: SECURITY_GROUP_NAME.into(),
-        description: "Inbound rules for the ephemwork bastion".into(),
+        name: ctx.security_group_name(),
+        description: format!(
+            "Inbound rules for the ephemwork bastion (project {})",
+            ctx.project_name
+        ),
         ingress: vec![IngressRule {
             protocol: "tcp",
             from_port: 80,
@@ -156,10 +184,11 @@ systemctl enable --now ephemwork-bastion.service
 
 /// Tags applied to the launched instance so `bastion status`/`destroy` can
 /// find it again.
-pub fn instance_tags() -> BTreeMap<&'static str, &'static str> {
+pub fn instance_tags(ctx: &BastionContext) -> BTreeMap<String, String> {
     let mut t = BTreeMap::new();
-    t.insert("Name", BASTION_NAME);
-    t.insert("ManagedBy", "ephemwork");
+    t.insert("Name".into(), ctx.instance_name());
+    t.insert("ManagedBy".into(), "ephemwork".into());
+    t.insert("EphemworkProject".into(), ctx.project_name.clone());
     t
 }
 
@@ -181,23 +210,21 @@ pub struct LaunchPlan {
 impl LaunchPlan {
     pub fn from_config(
         cfg: &TunnelConfig,
+        ctx: &BastionContext,
         ami_id: &str,
         subnet_id: &str,
         security_group_id: &str,
         bastion_binary_s3_uri: &str,
     ) -> Result<Self> {
         let user_data = user_data_script(bastion_binary_s3_uri)?;
-        let tags = instance_tags()
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let tags = instance_tags(ctx).into_iter().collect();
         Ok(Self {
             region: cfg.region.clone(),
             instance_type: cfg.instance_type.clone(),
             ami_id: ami_id.into(),
             subnet_id: subnet_id.into(),
             security_group_id: security_group_id.into(),
-            instance_profile_name: IAM_INSTANCE_PROFILE_NAME.into(),
+            instance_profile_name: ctx.iam_instance_profile_name(),
             user_data,
             tags,
         })
@@ -236,11 +263,14 @@ pub struct DestroyOutcome {
 }
 
 /// Tear down the bastion in reverse order. Failure modes:
-///   - No instance tagged BASTION_NAME: returns Ok with empty IDs (idempotent).
+///   - No instance tagged Name=<bastion>: returns Ok with empty IDs.
 ///   - SG removal failure: returned to caller; instance termination has
 ///     already happened so a re-run will skip it.
-pub fn run_destroy(provisioner: &mut dyn BastionProvisioner) -> Result<DestroyOutcome> {
-    let summary = provisioner.find_instance_by_name(BASTION_NAME)?;
+pub fn run_destroy(
+    provisioner: &mut dyn BastionProvisioner,
+    ctx: &BastionContext,
+) -> Result<DestroyOutcome> {
+    let summary = provisioner.find_instance_by_name(&ctx.instance_name())?;
     let Some(summary) = summary else {
         return Ok(DestroyOutcome::default());
     };
@@ -261,16 +291,20 @@ pub struct BastionStatus {
     pub instance: Option<InstanceSummary>,
 }
 
-pub fn run_status(provisioner: &mut dyn BastionProvisioner) -> Result<BastionStatus> {
-    let instance = provisioner.find_instance_by_name(BASTION_NAME)?;
+pub fn run_status(
+    provisioner: &mut dyn BastionProvisioner,
+    ctx: &BastionContext,
+) -> Result<BastionStatus> {
+    let instance = provisioner.find_instance_by_name(&ctx.instance_name())?;
     Ok(BastionStatus { instance })
 }
 
-pub fn render_bastion_status(status: &BastionStatus) -> String {
+pub fn render_bastion_status(status: &BastionStatus, ctx: &BastionContext) -> String {
     match &status.instance {
         None => format!(
-            "no bastion found (no instance tagged Name={BASTION_NAME}).\n\
-             run `ephemwork bastion init --live ...` to provision one."
+            "no bastion found (no instance tagged Name={}).\n\
+             run `ephemwork bastion init --live ...` to provision one.",
+            ctx.instance_name()
         ),
         Some(s) => {
             let ip = s.private_ip.as_deref().unwrap_or("?");
@@ -290,17 +324,20 @@ pub fn render_bastion_status(status: &BastionStatus) -> String {
 /// the rest of the orchestration runs unchanged.
 pub struct PlanLogger {
     pub log: Vec<String>,
+    pub ctx: BastionContext,
+    /// Whether `find_instance_by_name` should pretend the instance already
+    /// exists (true) or that there's nothing yet (false). Defaults to
+    /// false so `bastion init` dry-run shows the create path.
+    pub pretend_existing: bool,
 }
 
 impl PlanLogger {
-    pub fn new() -> Self {
-        Self { log: Vec::new() }
-    }
-}
-
-impl Default for PlanLogger {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(ctx: BastionContext) -> Self {
+        Self {
+            log: Vec::new(),
+            ctx,
+            pretend_existing: false,
+        }
     }
 }
 
@@ -316,8 +353,8 @@ impl BastionProvisioner for PlanLogger {
     fn ensure_iam_role(&mut self) -> Result<()> {
         self.log.push(format!(
             "[plan] ensure IAM role {:?} + instance profile {:?} with {} managed policies",
-            IAM_ROLE_NAME,
-            IAM_INSTANCE_PROFILE_NAME,
+            self.ctx.iam_role_name(),
+            self.ctx.iam_instance_profile_name(),
             managed_policy_arns().len()
         ));
         Ok(())
@@ -345,12 +382,16 @@ impl BastionProvisioner for PlanLogger {
     fn find_instance_by_name(&mut self, name: &str) -> Result<Option<InstanceSummary>> {
         self.log
             .push(format!("[plan] look up instance tagged Name={name}"));
-        Ok(Some(InstanceSummary {
-            instance_id: "i-DRYRUN".into(),
-            state: "running".into(),
-            private_ip: Some("10.0.0.42".into()),
-            security_group_id: Some("sg-DRYRUN".into()),
-        }))
+        if self.pretend_existing {
+            Ok(Some(InstanceSummary {
+                instance_id: "i-DRYRUN".into(),
+                state: "running".into(),
+                private_ip: Some("10.0.0.42".into()),
+                security_group_id: Some("sg-DRYRUN".into()),
+            }))
+        } else {
+            Ok(None)
+        }
     }
     fn terminate_instance(&mut self, instance_id: &str) -> Result<()> {
         self.log
@@ -364,7 +405,9 @@ impl BastionProvisioner for PlanLogger {
     }
     fn delete_iam_role(&mut self) -> Result<()> {
         self.log.push(format!(
-            "[plan] delete IAM role {IAM_ROLE_NAME} + instance profile {IAM_INSTANCE_PROFILE_NAME}"
+            "[plan] delete IAM role {} + instance profile {}",
+            self.ctx.iam_role_name(),
+            self.ctx.iam_instance_profile_name(),
         ));
         Ok(())
     }
@@ -374,15 +417,31 @@ impl BastionProvisioner for PlanLogger {
 pub struct InitOutcome {
     pub security_group_id: String,
     pub instance_id: String,
+    /// True when an existing instance was reused instead of creating a new
+    /// one. Used by the CLI to print "(already provisioned)" rather than
+    /// "(provisioned)".
+    pub reused: bool,
 }
 
 /// Drive a `BastionProvisioner` through the full init sequence. Pure
-/// orchestration so the order of calls is testable.
+/// orchestration so the order of calls is testable. Idempotent: if an
+/// instance tagged Name=<bastion> already exists in a non-terminal state,
+/// it is reused and no new resources are created.
 pub fn run_init(
     provisioner: &mut dyn BastionProvisioner,
+    ctx: &BastionContext,
     sg_plan: &SecurityGroupPlan,
     launch_plan_for: impl FnOnce(&str) -> Result<LaunchPlan>,
 ) -> Result<InitOutcome> {
+    if let Some(existing) = provisioner.find_instance_by_name(&ctx.instance_name())? {
+        if !matches!(existing.state.as_str(), "terminated" | "shutting-down" | "") {
+            return Ok(InitOutcome {
+                security_group_id: existing.security_group_id.unwrap_or_default(),
+                instance_id: existing.instance_id,
+                reused: true,
+            });
+        }
+    }
     provisioner.ensure_iam_role()?;
     let sg_id = provisioner.ensure_security_group(sg_plan)?;
     let plan = launch_plan_for(&sg_id)?;
@@ -391,6 +450,7 @@ pub fn run_init(
     Ok(InitOutcome {
         security_group_id: sg_id,
         instance_id,
+        reused: false,
     })
 }
 
@@ -403,7 +463,12 @@ mod tests {
             r#type: "ec2".into(),
             region: "us-east-1".into(),
             instance_type: "t4g.nano".into(),
+            project_name: "demo".into(),
         }
+    }
+
+    fn ctx() -> BastionContext {
+        BastionContext::new("demo")
     }
 
     #[test]
@@ -422,8 +487,8 @@ mod tests {
 
     #[test]
     fn security_group_plan_locks_port_80_to_alb_sg() {
-        let plan = security_group_plan("sg-0123abc").unwrap();
-        assert_eq!(plan.name, SECURITY_GROUP_NAME);
+        let plan = security_group_plan(&ctx(), "sg-0123abc").unwrap();
+        assert_eq!(plan.name, "ephemwork-demo-bastion-sg");
         assert_eq!(plan.ingress.len(), 1);
         let rule = &plan.ingress[0];
         assert_eq!(rule.protocol, "tcp");
@@ -437,8 +502,24 @@ mod tests {
 
     #[test]
     fn security_group_plan_rejects_empty_alb() {
-        let err = security_group_plan("").unwrap_err().to_string();
+        let err = security_group_plan(&ctx(), "").unwrap_err().to_string();
         assert!(err.contains("alb_security_group_id"), "got: {err}");
+    }
+
+    #[test]
+    fn bastion_context_derives_per_project_names() {
+        let c = BastionContext::new("demo");
+        assert_eq!(c.instance_name(), "ephemwork-demo-bastion");
+        assert_eq!(c.security_group_name(), "ephemwork-demo-bastion-sg");
+        assert_eq!(c.iam_role_name(), "ephemwork-demo-bastion-role");
+        assert_eq!(
+            c.iam_instance_profile_name(),
+            "ephemwork-demo-bastion-instance-profile"
+        );
+
+        let other = BastionContext::new("other");
+        assert_ne!(c.instance_name(), other.instance_name());
+        assert_ne!(c.security_group_name(), other.security_group_name());
     }
 
     #[test]
@@ -459,16 +540,18 @@ mod tests {
     }
 
     #[test]
-    fn instance_tags_mark_managed_by_ephemwork() {
-        let tags = instance_tags();
-        assert_eq!(tags.get("Name"), Some(&BASTION_NAME));
-        assert_eq!(tags.get("ManagedBy"), Some(&"ephemwork"));
+    fn instance_tags_mark_managed_by_ephemwork_and_project() {
+        let tags = instance_tags(&ctx());
+        assert_eq!(tags.get("Name").map(|s| s.as_str()), Some("ephemwork-demo-bastion"));
+        assert_eq!(tags.get("ManagedBy").map(|s| s.as_str()), Some("ephemwork"));
+        assert_eq!(tags.get("EphemworkProject").map(|s| s.as_str()), Some("demo"));
     }
 
     #[test]
     fn launch_plan_packs_inputs() {
         let plan = LaunchPlan::from_config(
             &cfg(),
+            &ctx(),
             "ami-1234",
             "subnet-abc",
             "sg-xyz",
@@ -480,12 +563,15 @@ mod tests {
         assert_eq!(plan.ami_id, "ami-1234");
         assert_eq!(plan.subnet_id, "subnet-abc");
         assert_eq!(plan.security_group_id, "sg-xyz");
-        assert_eq!(plan.instance_profile_name, IAM_INSTANCE_PROFILE_NAME);
+        assert_eq!(
+            plan.instance_profile_name,
+            "ephemwork-demo-bastion-instance-profile"
+        );
         assert!(plan.user_data.contains("s3://bucket/bin"));
         assert!(plan
             .tags
             .iter()
-            .any(|(k, v)| k == "Name" && v == BASTION_NAME));
+            .any(|(k, v)| k == "Name" && v == "ephemwork-demo-bastion"));
     }
 
     /// Records which methods were called and in what order so the
@@ -537,10 +623,11 @@ mod tests {
     #[test]
     fn run_init_orders_calls_correctly() {
         let mut prov = MockProvisioner::default();
-        let sg_plan = security_group_plan("sg-alb").unwrap();
-        let outcome = run_init(&mut prov, &sg_plan, |sg_id| {
+        let sg_plan = security_group_plan(&ctx(), "sg-alb").unwrap();
+        let outcome = run_init(&mut prov, &ctx(), &sg_plan, |sg_id| {
             LaunchPlan::from_config(
                 &cfg(),
+                &ctx(),
                 "ami-1234",
                 "subnet-abc",
                 sg_id,
@@ -551,6 +638,7 @@ mod tests {
         assert_eq!(
             prov.calls,
             vec![
+                "find_instance_by_name",
                 "ensure_iam_role",
                 "ensure_security_group",
                 "launch_instance",
@@ -559,17 +647,69 @@ mod tests {
         );
         assert_eq!(outcome.security_group_id, "sg-mocked");
         assert_eq!(outcome.instance_id, "i-mocked");
+        assert!(!outcome.reused);
         let launched = prov.last_launch_plan.unwrap();
         assert_eq!(launched.security_group_id, "sg-mocked");
     }
 
     #[test]
-    fn plan_logger_records_each_step() {
-        let mut logger = PlanLogger::new();
-        let sg_plan = security_group_plan("sg-alb").unwrap();
-        run_init(&mut logger, &sg_plan, |sg_id| {
+    fn run_init_short_circuits_when_instance_already_exists() {
+        let mut prov = MockProvisioner {
+            instance_to_return: Some(InstanceSummary {
+                instance_id: "i-existing".into(),
+                state: "running".into(),
+                private_ip: Some("10.0.0.5".into()),
+                security_group_id: Some("sg-existing".into()),
+            }),
+            ..Default::default()
+        };
+        let sg_plan = security_group_plan(&ctx(), "sg-alb").unwrap();
+        let outcome = run_init(&mut prov, &ctx(), &sg_plan, |_| {
+            panic!("launch_plan must not be built when reusing existing instance")
+        })
+        .unwrap();
+        assert!(outcome.reused);
+        assert_eq!(outcome.instance_id, "i-existing");
+        assert_eq!(outcome.security_group_id, "sg-existing");
+        // Only the lookup happens; no creation calls.
+        assert_eq!(prov.calls, vec!["find_instance_by_name"]);
+    }
+
+    #[test]
+    fn run_init_treats_terminated_instance_as_absent() {
+        let mut prov = MockProvisioner {
+            instance_to_return: Some(InstanceSummary {
+                instance_id: "i-old".into(),
+                state: "terminated".into(),
+                private_ip: None,
+                security_group_id: None,
+            }),
+            ..Default::default()
+        };
+        let sg_plan = security_group_plan(&ctx(), "sg-alb").unwrap();
+        let outcome = run_init(&mut prov, &ctx(), &sg_plan, |sg_id| {
             LaunchPlan::from_config(
                 &cfg(),
+                &ctx(),
+                "ami-1",
+                "subnet-1",
+                sg_id,
+                "s3://b/b",
+            )
+        })
+        .unwrap();
+        assert!(!outcome.reused);
+        assert_eq!(outcome.instance_id, "i-mocked");
+    }
+
+    #[test]
+    fn plan_logger_records_each_step() {
+        let mut logger = PlanLogger::new(ctx());
+        let sg_plan = security_group_plan(&ctx(), "sg-alb").unwrap();
+        run_init(&mut logger, &ctx(), &sg_plan, |sg_id| {
+            LaunchPlan::from_config(
+                &cfg(),
+                &ctx(),
                 "ami-9999",
                 "subnet-test",
                 sg_id,
@@ -577,13 +717,15 @@ mod tests {
             )
         })
         .unwrap();
-        assert_eq!(logger.log.len(), 4);
-        assert!(logger.log[0].contains("IAM role"));
-        assert!(logger.log[1].contains("security group"));
-        assert!(logger.log[2].contains("launch t4g.nano"));
-        assert!(logger.log[2].contains("subnet-test"));
-        assert!(logger.log[2].contains("ami-9999"));
-        assert!(logger.log[3].contains("i-DRYRUN"));
+        // First entry is the lookup; remaining 4 are the create path.
+        assert_eq!(logger.log.len(), 5);
+        assert!(logger.log[0].contains("look up instance"));
+        assert!(logger.log[1].contains("IAM role"));
+        assert!(logger.log[2].contains("security group"));
+        assert!(logger.log[3].contains("launch t4g.nano"));
+        assert!(logger.log[3].contains("subnet-test"));
+        assert!(logger.log[3].contains("ami-9999"));
+        assert!(logger.log[4].contains("i-DRYRUN"));
     }
 
     #[test]
@@ -603,7 +745,10 @@ mod tests {
                 panic!("must not be called")
             }
             fn find_instance_by_name(&mut self, _: &str) -> Result<Option<InstanceSummary>> {
-                panic!("must not be called")
+                // run_init's idempotency check calls this first; report no
+                // existing instance so the IAM step (which is what we're
+                // asserting fails) is reached.
+                Ok(None)
             }
             fn terminate_instance(&mut self, _: &str) -> Result<()> {
                 panic!("must not be called")
@@ -616,8 +761,8 @@ mod tests {
             }
         }
         let mut p = Failing;
-        let sg_plan = security_group_plan("sg-alb").unwrap();
-        let err = run_init(&mut p, &sg_plan, |_| panic!("must not be called"))
+        let sg_plan = security_group_plan(&ctx(), "sg-alb").unwrap();
+        let err = run_init(&mut p, &ctx(), &sg_plan, |_| panic!("must not be called"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("denied"), "got: {err}");
@@ -629,7 +774,7 @@ mod tests {
             instance_to_return: None,
             ..Default::default()
         };
-        let outcome = run_destroy(&mut p).unwrap();
+        let outcome = run_destroy(&mut p, &ctx()).unwrap();
         assert!(outcome.instance_id.is_none());
         assert_eq!(p.calls, vec!["find_instance_by_name"]);
     }
@@ -645,7 +790,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let outcome = run_destroy(&mut p).unwrap();
+        let outcome = run_destroy(&mut p, &ctx()).unwrap();
         assert_eq!(outcome.instance_id.as_deref(), Some("i-real"));
         assert_eq!(outcome.security_group_id.as_deref(), Some("sg-real"));
         assert_eq!(
@@ -670,7 +815,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        run_destroy(&mut p).unwrap();
+        run_destroy(&mut p, &ctx()).unwrap();
         assert!(!p.calls.iter().any(|c| *c == "delete_security_group"));
         assert!(p.calls.iter().any(|c| *c == "delete_iam_role"));
     }
@@ -686,27 +831,31 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = run_status(&mut p).unwrap();
+        let s = run_status(&mut p, &ctx()).unwrap();
         assert_eq!(s.instance.as_ref().unwrap().instance_id, "i-99");
     }
 
     #[test]
     fn render_bastion_status_no_instance() {
-        let s = render_bastion_status(&BastionStatus { instance: None });
+        let s = render_bastion_status(&BastionStatus { instance: None }, &ctx());
         assert!(s.contains("no bastion found"));
         assert!(s.contains("ephemwork bastion init"));
+        assert!(s.contains("ephemwork-demo-bastion"));
     }
 
     #[test]
     fn render_bastion_status_with_instance() {
-        let s = render_bastion_status(&BastionStatus {
-            instance: Some(InstanceSummary {
-                instance_id: "i-99".into(),
-                state: "running".into(),
-                private_ip: Some("10.0.0.7".into()),
-                security_group_id: Some("sg-99".into()),
-            }),
-        });
+        let s = render_bastion_status(
+            &BastionStatus {
+                instance: Some(InstanceSummary {
+                    instance_id: "i-99".into(),
+                    state: "running".into(),
+                    private_ip: Some("10.0.0.7".into()),
+                    security_group_id: Some("sg-99".into()),
+                }),
+            },
+            &ctx(),
+        );
         assert!(s.contains("i-99"));
         assert!(s.contains("running"));
         assert!(s.contains("10.0.0.7"));
@@ -715,8 +864,9 @@ mod tests {
 
     #[test]
     fn plan_logger_destroy_records_each_step() {
-        let mut logger = PlanLogger::new();
-        run_destroy(&mut logger).unwrap();
+        let mut logger = PlanLogger::new(ctx());
+        logger.pretend_existing = true;
+        run_destroy(&mut logger, &ctx()).unwrap();
         assert!(logger.log.iter().any(|l| l.contains("look up instance")));
         assert!(logger.log.iter().any(|l| l.contains("terminate instance")));
         assert!(logger.log.iter().any(|l| l.contains("delete security group")));

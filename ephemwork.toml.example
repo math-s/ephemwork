@@ -1,4 +1,8 @@
 [tunnel]
+# Identifier for this project. Used to derive AWS resource names
+# (ephemwork-<project_name>-bastion, -sg, -role, -instance-profile),
+# so two projects in the same AWS account never collide.
+project_name = "myproject"
 type = "ec2"
 region = "us-east-1"
 instance_type = "t4g.nano"
