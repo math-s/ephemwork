@@ -12,7 +12,10 @@ use crate::bastion_protocol::{DeregisterRequest, RegisterRequest};
 use crate::bastion_provisioner::{BastionContext, BastionProvisioner, InstanceSummary};
 use crate::config::{current_user, Config};
 use crate::runner::{spawn_service, wait_for_health, HealthCheck, RunningService};
-use crate::ssm::{start_port_forward, PortForwardSpec, SsmTunnel};
+use crate::ssm::{
+    parse_forward_port_spec, start_port_forward, start_remote_host_forward, PortForwardSpec,
+    RemoteHostForwardSpec, SsmTunnel,
+};
 use crate::state::{default_state_path, Session, State};
 use crate::tunnel::{open_ssh2_reverse_forward, ReverseForward, SshAuth, SshConfig};
 use anyhow::{anyhow, Context, Result};
@@ -182,6 +185,9 @@ pub struct UpRequest {
     pub ssh_username: String,
     pub ssh_keepalive: Duration,
     pub health_timeout: Duration,
+    /// Raw `"local:host:remote"` strings from `service.<name>.forward_ports`.
+    /// Validated at request build time; opened via SSM in `up_service`.
+    pub forward_ports: Vec<String>,
 }
 
 impl UpRequest {
@@ -190,6 +196,11 @@ impl UpRequest {
 
     pub fn from_config(cfg: &Config, service: &str, user: &str) -> Result<Self> {
         let svc = lookup_service(cfg, service)?;
+        // Validate every forward spec early so a typo in ephemwork.toml
+        // surfaces before we open any SSM tunnel.
+        for raw in &svc.forward_ports {
+            parse_forward_port_spec(raw)?;
+        }
         Ok(Self {
             user: user.to_string(),
             service: service.to_string(),
@@ -200,6 +211,7 @@ impl UpRequest {
             ssh_username: Self::DEFAULT_SSH_USERNAME.to_string(),
             ssh_keepalive: Duration::from_secs(30),
             health_timeout: Duration::from_secs(60),
+            forward_ports: svc.forward_ports.clone(),
         })
     }
 }
@@ -215,12 +227,14 @@ pub struct ActiveSession {
 
     /// Order matters: drop the SSH reverse forward first (closes the
     /// bastion-side listener), then the runner (kills the local service),
-    /// then the SSM tunnels (closes both `aws ssm start-session` children).
+    /// then the SSM tunnels (closes both `aws ssm start-session` children),
+    /// then any outbound forward-port SSM tunnels.
     /// `Option` lets us take ownership during cleanup.
     reverse: Option<ReverseForward>,
     runner: Option<RunningService>,
     ssh_ssm: Option<SsmTunnel>,
     cp_ssm: Option<SsmTunnel>,
+    forward_ssm: Vec<SsmTunnel>,
 
     /// Endpoint of the control-plane port forward, used for deregistration.
     cp_endpoint: BastionEndpoint,
@@ -247,6 +261,7 @@ impl ActiveSession {
         let _ = self.runner.take();
         let _ = self.ssh_ssm.take();
         let _ = self.cp_ssm.take();
+        self.forward_ssm.clear();
     }
 }
 
@@ -282,6 +297,31 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     .context("opening SSM port-forward to bastion SSH")?;
     wait_for_local_port(ssh_ssm.local_port, Duration::from_secs(15))
         .context("SSH SSM port-forward never became reachable")?;
+
+    // Outbound forwards through the bastion to VPC-private hosts (e.g.
+    // staging RDS). Opened before the local service starts so e.g. uvicorn
+    // can resolve its DB connection on first boot.
+    let mut forward_ssm: Vec<SsmTunnel> = Vec::with_capacity(req.forward_ports.len());
+    for raw in &req.forward_ports {
+        let spec = parse_forward_port_spec(raw)?;
+        let tunnel = start_remote_host_forward(&RemoteHostForwardSpec {
+            target: bastion.instance_id.clone(),
+            remote_host: spec.remote_host.clone(),
+            remote_port: spec.remote_port,
+            local_port: spec.local_port,
+            region: req.region.clone(),
+        })
+        .with_context(|| format!("opening forward {raw}"))?;
+        wait_for_local_port(spec.local_port, Duration::from_secs(15))
+            .with_context(|| format!("forward {raw} never became reachable"))?;
+        tracing::info!(
+            local = spec.local_port,
+            host = %spec.remote_host,
+            remote = spec.remote_port,
+            "outbound forward open"
+        );
+        forward_ssm.push(tunnel);
+    }
 
     // Spawn the local service and wait for its health endpoint, if any.
     let service = spawn_service(&req.run_command, Stdio::inherit(), Stdio::inherit())?;
@@ -334,6 +374,7 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
         runner: Some(service),
         ssh_ssm: Some(ssh_ssm),
         cp_ssm: Some(cp_ssm),
+        forward_ssm,
         cp_endpoint,
     })
 }
@@ -447,6 +488,7 @@ mod tests {
                     build_command: None,
                     run_command: "x".into(),
                     health_check_path: None,
+                    forward_ports: Vec::new(),
                 },
             );
         }
@@ -571,6 +613,26 @@ mod tests {
         assert_eq!(req.ssh_username, UpRequest::DEFAULT_SSH_USERNAME);
         assert!(req.ssh_keepalive >= Duration::from_secs(1));
         assert!(req.health_timeout >= Duration::from_secs(1));
+        assert!(req.forward_ports.is_empty());
+    }
+
+    #[test]
+    fn up_request_propagates_forward_ports() {
+        let mut cfg = cfg_with(&[("api", 8000)]);
+        cfg.service.get_mut("api").unwrap().forward_ports =
+            vec!["5432:rds.example.com:5432".into()];
+        let req = UpRequest::from_config(&cfg, "api", "matheus").unwrap();
+        assert_eq!(req.forward_ports, vec!["5432:rds.example.com:5432"]);
+    }
+
+    #[test]
+    fn up_request_rejects_malformed_forward_port_at_build_time() {
+        let mut cfg = cfg_with(&[("api", 8000)]);
+        cfg.service.get_mut("api").unwrap().forward_ports = vec!["not-a-spec".into()];
+        let err = UpRequest::from_config(&cfg, "api", "matheus")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not-a-spec"), "got: {err}");
     }
 
     #[test]
@@ -619,6 +681,7 @@ mod tests {
             runner: None,
             ssh_ssm: None,
             cp_ssm: None,
+            forward_ssm: Vec::new(),
             cp_endpoint: BastionEndpoint::new("127.0.0.1", 5555),
         };
         assert_eq!(sess.header_value(), "matheus:api");
