@@ -245,6 +245,20 @@ ephemwork down api        # stop the local service and tear down the tunnel
 ephemwork down            # stop everything for the current user
 ```
 
+### Editing the env file? Restart the whole `ephemwork up`
+
+`ephemwork up` exports your env file once when it spawns the service, then
+your service's own watcher (e.g. `uvicorn --reload`) re-reads source files
+on save. **Watchers don't re-source env files.** If you edit
+`.env.staging` (or whatever your `run_command` sources) you need to:
+
+1. Ctrl-C the running `ephemwork up` (sends SIGINT, deregisters with
+   bastion, kills the local service).
+2. Re-run `ephemwork up <service>`.
+
+Just saving the file and waiting won't propagate the change — your
+service is still living with the old env.
+
 ## Threat model
 
 - **No public SSH on the bastion.** Port 22 is bound to the SG only; the
