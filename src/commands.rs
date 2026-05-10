@@ -13,8 +13,8 @@ use crate::bastion_provisioner::{BastionContext, BastionProvisioner, InstanceSum
 use crate::config::{current_user, Config};
 use crate::runner::{spawn_service, wait_for_health, HealthCheck, RunningService};
 use crate::ssm::{
-    parse_forward_port_spec, start_port_forward, start_remote_host_forward, PortForwardSpec,
-    RemoteHostForwardSpec, SsmTunnel,
+    assert_plugin_available, parse_forward_port_spec, start_port_forward,
+    start_remote_host_forward, PortForwardSpec, RemoteHostForwardSpec, SsmTunnel,
 };
 use crate::state::{default_state_path, Session, State};
 use crate::tunnel::{open_ssh2_reverse_forward, ReverseForward, SshAuth, SshConfig};
@@ -276,6 +276,10 @@ impl ActiveSession {
 /// nothing on its own; the caller (typically main) decides whether to keep
 /// the returned `ActiveSession` alive (foreground UX) or hand it off.
 pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession> {
+    // Fail fast if the SSM plugin isn't installed: every port-forward
+    // would otherwise just time out at 15s with no hint.
+    assert_plugin_available().context("session-manager-plugin pre-flight")?;
+
     let mut provisioner =
         AwsBastionProvisioner::new(req.region.clone(), ctx.clone()).await?;
     let bastion = locate_bastion(&mut provisioner, &ctx)?;
@@ -459,6 +463,7 @@ async fn deregister_via_bastion(
     user: &str,
     sessions: &[Session],
 ) -> Result<()> {
+    assert_plugin_available().context("session-manager-plugin pre-flight")?;
     let mut provisioner =
         AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
     let bastion = match provisioner.find_instance_by_name(&ctx.instance_name())? {
