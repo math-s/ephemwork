@@ -123,6 +123,15 @@ async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
     let ctx = ctx_from_config(&cfg);
     let sg_plan = security_group_plan(&ctx, &args.alb_security_group_id)?;
 
+    // Read the SSH public key once so the closure below can borrow it.
+    let ssh_key = match &args.ssh_public_key {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+
     let build_launch_plan = |sg_id: &str| {
         LaunchPlan::from_config(
             &cfg.tunnel,
@@ -131,6 +140,7 @@ async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
             &args.subnet_id,
             sg_id,
             &args.bastion_binary_s3_uri,
+            ssh_key.as_deref(),
         )
     };
 

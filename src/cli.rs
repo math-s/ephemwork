@@ -73,6 +73,15 @@ pub struct BastionInitArgs {
     #[arg(long)]
     pub bastion_binary_s3_uri: String,
 
+    /// Path to an SSH public key file (e.g. ~/.ssh/id_ed25519.pub).
+    /// When set, the bastion's user-data installs the key into
+    /// /home/ec2-user/.ssh/authorized_keys so `ephemwork up` can open
+    /// the reverse SSH tunnel without an out-of-band SSM Run Command
+    /// step. If omitted, you'll need to push the key manually after
+    /// the instance comes up.
+    #[arg(long)]
+    pub ssh_public_key: Option<std::path::PathBuf>,
+
     /// Actually call AWS. Without this flag, ephemwork prints the plan and
     /// exits without creating any resources.
     #[arg(long, default_value_t = false)]

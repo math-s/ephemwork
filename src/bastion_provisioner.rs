@@ -122,15 +122,72 @@ pub fn security_group_plan(
     })
 }
 
+/// Validate that a string looks like an SSH public key. Pure so the
+/// shape check is unit-testable; we only require the leading
+/// algorithm token and a base64-ish payload, not full key validity.
+pub fn is_ssh_public_key(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let algo = match parts.next() {
+        Some(a) => a,
+        None => return false,
+    };
+    let known = [
+        "ssh-rsa",
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+    ];
+    if !known.contains(&algo) {
+        return false;
+    }
+    // Body should be at least one non-whitespace token.
+    parts.next().is_some_and(|body| !body.is_empty())
+}
+
 /// Build the user-data script that installs nginx + the bastion-server
 /// binary + systemd unit. The binary must be available at
 /// `bastion_binary_s3_uri` (e.g. s3://my-bucket/ephemwork-bastion-server-arm64).
-pub fn user_data_script(bastion_binary_s3_uri: &str) -> Result<String> {
+/// When `ssh_authorized_key` is `Some`, the key is written to
+/// `/home/ec2-user/.ssh/authorized_keys` so `ephemwork up` can open the
+/// reverse SSH tunnel without an out-of-band SSM Run Command.
+pub fn user_data_script(
+    bastion_binary_s3_uri: &str,
+    ssh_authorized_key: Option<&str>,
+) -> Result<String> {
     if !bastion_binary_s3_uri.starts_with("s3://") {
         return Err(anyhow!(
             "bastion_binary_s3_uri must be an s3:// URL, got {bastion_binary_s3_uri:?}"
         ));
     }
+    if let Some(key) = ssh_authorized_key {
+        if !is_ssh_public_key(key) {
+            return Err(anyhow!(
+                "ssh_authorized_key does not look like an SSH public key (expected `ssh-ed25519 …` or similar)"
+            ));
+        }
+    }
+
+    let ssh_block = match ssh_authorized_key {
+        Some(key) => {
+            let trimmed = key.trim();
+            format!(
+                "\n# Authorize the developer's SSH public key for ec2-user.\n\
+                 install -d -m 700 -o ec2-user -g ec2-user /home/ec2-user/.ssh\n\
+                 cat > /home/ec2-user/.ssh/authorized_keys <<'KEY'\n{trimmed}\nKEY\n\
+                 chown ec2-user:ec2-user /home/ec2-user/.ssh/authorized_keys\n\
+                 chmod 600 /home/ec2-user/.ssh/authorized_keys\n"
+            )
+        }
+        None => String::new(),
+    };
+
     Ok(format!(
         r#"#!/bin/bash
 set -euxo pipefail
@@ -146,6 +203,7 @@ install -d -m 0755 /etc/nginx/conf.d
 # Pull the prebuilt arm64 binary the operator uploaded.
 aws s3 cp "{s3_uri}" /opt/ephemwork/bastion-server
 chmod 0755 /opt/ephemwork/bastion-server
+{ssh_block}
 
 # Stub config so nginx starts before any sessions exist.
 cat > /etc/nginx/conf.d/ephemwork.conf <<'NGINX'
@@ -222,8 +280,9 @@ impl LaunchPlan {
         subnet_id: &str,
         security_group_id: &str,
         bastion_binary_s3_uri: &str,
+        ssh_authorized_key: Option<&str>,
     ) -> Result<Self> {
-        let user_data = user_data_script(bastion_binary_s3_uri)?;
+        let user_data = user_data_script(bastion_binary_s3_uri, ssh_authorized_key)?;
         let tags = instance_tags(ctx).into_iter().collect();
         Ok(Self {
             region: cfg.region.clone(),
@@ -532,19 +591,69 @@ mod tests {
 
     #[test]
     fn user_data_script_requires_s3_uri() {
-        let err = user_data_script("https://wrong").unwrap_err().to_string();
+        let err = user_data_script("https://wrong", None).unwrap_err().to_string();
         assert!(err.contains("s3://"), "got: {err}");
     }
 
     #[test]
     fn user_data_script_includes_required_steps() {
-        let s = user_data_script("s3://my-bucket/ephemwork-bastion-server").unwrap();
+        let s =
+            user_data_script("s3://my-bucket/ephemwork-bastion-server", None).unwrap();
         assert!(s.contains("install -y nginx"));
         assert!(s.contains("aws s3 cp \"s3://my-bucket/ephemwork-bastion-server\""));
         assert!(s.contains("/opt/ephemwork/bastion-server"));
         assert!(s.contains("ephemwork-bastion.service"));
         assert!(s.contains("EPHEMWORK_REGISTRY_PATH"));
         assert!(s.contains("systemctl enable --now ephemwork-bastion.service"));
+        // Without a key, no authorized_keys block should appear.
+        assert!(!s.contains("authorized_keys"));
+    }
+
+    #[test]
+    fn user_data_script_installs_authorized_key_when_provided() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIZlFU6Jhe068GNrp1gBk4FtCZCKvddk7r49bUdupZQi ephemwork@laptop";
+        let s =
+            user_data_script("s3://b/b", Some(key)).expect("valid key should produce script");
+        assert!(s.contains("/home/ec2-user/.ssh/authorized_keys"));
+        assert!(s.contains("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"));
+        assert!(s.contains("chmod 600 /home/ec2-user/.ssh/authorized_keys"));
+        assert!(s.contains("install -d -m 700 -o ec2-user -g ec2-user /home/ec2-user/.ssh"));
+    }
+
+    #[test]
+    fn user_data_script_rejects_garbage_key() {
+        let err = user_data_script("s3://b/b", Some("not a key"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ssh-ed25519"), "got: {err}");
+    }
+
+    #[test]
+    fn user_data_script_trims_whitespace_around_key() {
+        let key = "  ssh-rsa AAAAB3NzaC1yc2E foo@bar  \n";
+        let s = user_data_script("s3://b/b", Some(key)).unwrap();
+        // The trimmed key body should appear; trailing whitespace must
+        // not leak into the heredoc.
+        assert!(s.contains("ssh-rsa AAAAB3NzaC1yc2E foo@bar"));
+        assert!(!s.contains("foo@bar  \n"));
+    }
+
+    #[test]
+    fn is_ssh_public_key_recognizes_common_algos() {
+        assert!(is_ssh_public_key("ssh-ed25519 AAAA foo@bar"));
+        assert!(is_ssh_public_key("ssh-rsa AAAA foo@bar"));
+        assert!(is_ssh_public_key("ecdsa-sha2-nistp256 AAAA"));
+        assert!(is_ssh_public_key("sk-ssh-ed25519@openssh.com AAAA"));
+        assert!(is_ssh_public_key("  ssh-ed25519 AAAA  \n"));
+    }
+
+    #[test]
+    fn is_ssh_public_key_rejects_garbage() {
+        assert!(!is_ssh_public_key(""));
+        assert!(!is_ssh_public_key("    "));
+        assert!(!is_ssh_public_key("hello world"));
+        assert!(!is_ssh_public_key("ssh-ed25519")); // no body
+        assert!(!is_ssh_public_key("ssh-fake AAAA")); // unknown algo
     }
 
     #[test]
@@ -564,6 +673,7 @@ mod tests {
             "subnet-abc",
             "sg-xyz",
             "s3://bucket/bin",
+            None,
         )
         .unwrap();
         assert_eq!(plan.region, "us-east-1");
@@ -640,6 +750,7 @@ mod tests {
                 "subnet-abc",
                 sg_id,
                 "s3://bucket/bin",
+                None,
             )
         })
         .unwrap();
@@ -703,6 +814,7 @@ mod tests {
                 "subnet-1",
                 sg_id,
                 "s3://b/b",
+                None,
             )
         })
         .unwrap();
@@ -722,6 +834,7 @@ mod tests {
                 "subnet-test",
                 sg_id,
                 "s3://bucket/bin",
+                None,
             )
         })
         .unwrap();
