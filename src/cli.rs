@@ -43,6 +43,26 @@ pub enum BastionCommand {
     Destroy(BastionDestroyArgs),
     /// Show bastion status (instance ID, state).
     Status,
+    /// Build the bastion-server binary, upload to S3, and restart the
+    /// systemd unit on the running bastion. Use after editing
+    /// bastion-server code to push changes without re-provisioning.
+    Redeploy(BastionRedeployArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct BastionRedeployArgs {
+    /// S3 URL where the new binary is uploaded. Must be the same URI the
+    /// bastion's user-data was originally configured with so the running
+    /// instance can re-fetch from there.
+    /// Example: s3://my-bucket/ephemwork-bastion-server
+    #[arg(long)]
+    pub bastion_binary_s3_uri: String,
+
+    /// Skip the cargo zigbuild step. Useful when the binary is already
+    /// built (e.g. CI uploaded it) and only the SSM redeploy step needs
+    /// running.
+    #[arg(long, default_value_t = false)]
+    pub skip_build: bool,
 }
 
 #[derive(Args, Debug)]
@@ -245,6 +265,46 @@ mod tests {
             cli.command,
             Command::Bastion(BastionCommand::Status)
         ));
+    }
+
+    #[test]
+    fn bastion_redeploy_parses() {
+        let cli = parse(&[
+            "ephemwork",
+            "bastion",
+            "redeploy",
+            "--bastion-binary-s3-uri",
+            "s3://b/k",
+        ]);
+        match cli.command {
+            Command::Bastion(BastionCommand::Redeploy(args)) => {
+                assert_eq!(args.bastion_binary_s3_uri, "s3://b/k");
+                assert!(!args.skip_build);
+            }
+            other => panic!("expected Redeploy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bastion_redeploy_skip_build_flag() {
+        let cli = parse(&[
+            "ephemwork",
+            "bastion",
+            "redeploy",
+            "--bastion-binary-s3-uri",
+            "s3://b/k",
+            "--skip-build",
+        ]);
+        match cli.command {
+            Command::Bastion(BastionCommand::Redeploy(args)) => assert!(args.skip_build),
+            other => panic!("expected Redeploy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bastion_redeploy_requires_s3_uri() {
+        let err = Cli::try_parse_from_iter(["ephemwork", "bastion", "redeploy"]).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("bastion-binary-s3-uri"));
     }
 
     #[test]

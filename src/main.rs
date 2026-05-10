@@ -1,10 +1,11 @@
 use ephemwork::aws_bastion_provisioner::{verify_vpc_match, AwsBastionProvisioner};
 use ephemwork::bastion_provisioner::{
     render_bastion_status, run_destroy, run_init, run_status as run_bastion_status,
-    security_group_plan, BastionContext, LaunchPlan, PlanLogger,
+    security_group_plan, BastionContext, BastionProvisioner, LaunchPlan, PlanLogger,
 };
 use ephemwork::cli::{
-    BastionCommand, BastionDestroyArgs, BastionInitArgs, Cli, Command, DownArgs, UpArgs,
+    BastionCommand, BastionDestroyArgs, BastionInitArgs, BastionRedeployArgs, Cli, Command,
+    DownArgs, UpArgs,
 };
 use ephemwork::commands::{
     down_service, render_status, status as run_status, up_service, UpRequest,
@@ -28,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
             BastionCommand::Init(args) => bastion_init(args).await?,
             BastionCommand::Destroy(args) => bastion_destroy(args).await?,
             BastionCommand::Status => bastion_status().await?,
+            BastionCommand::Redeploy(args) => bastion_redeploy(args).await?,
         },
     }
 
@@ -258,6 +260,180 @@ async fn bastion_destroy(args: BastionDestroyArgs) -> anyhow::Result<()> {
         None => println!("nothing to do (no bastion instance found)."),
     }
     Ok(())
+}
+
+async fn bastion_redeploy(args: BastionRedeployArgs) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let ctx = ctx_from_config(&cfg);
+
+    // 1. Locate the running bastion (we need its instance ID for the
+    //    SSM Run Command). Errors clearly when none is provisioned.
+    let mut provisioner =
+        AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+    let bastion = provisioner
+        .find_instance_by_name(&ctx.instance_name())?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no bastion found for project {:?}; run `ephemwork bastion init --live` first",
+                ctx.project_name
+            )
+        })?;
+    println!("→ targeting bastion {}", bastion.instance_id);
+
+    // 2. Build the binary.
+    if !args.skip_build {
+        println!("→ cargo zigbuild --release --target aarch64-unknown-linux-musl");
+        let status = std::process::Command::new("cargo")
+            .args([
+                "zigbuild",
+                "--release",
+                "--target",
+                "aarch64-unknown-linux-musl",
+                "-p",
+                "ephemwork-bastion-server",
+            ])
+            .status()
+            .map_err(|e| anyhow::anyhow!("spawning cargo zigbuild: {e}"))?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("cargo zigbuild failed (status {status:?})"));
+        }
+    } else {
+        println!("→ --skip-build: not building the binary");
+    }
+
+    let binary_path = "target/aarch64-unknown-linux-musl/release/ephemwork-bastion-server";
+    if !std::path::Path::new(binary_path).exists() {
+        return Err(anyhow::anyhow!(
+            "binary not found at {binary_path}. Either run without --skip-build, or build it manually first."
+        ));
+    }
+
+    // 3. Upload to S3.
+    println!("→ aws s3 cp {binary_path} {}", args.bastion_binary_s3_uri);
+    let status = std::process::Command::new("aws")
+        .args(["s3", "cp", binary_path, &args.bastion_binary_s3_uri])
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawning aws s3 cp: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("aws s3 cp failed (status {status:?})"));
+    }
+
+    // 4. SSM Run Command on the bastion: re-pull, swap, restart.
+    let script = ephemwork::bastion_provisioner::redeploy_script(&args.bastion_binary_s3_uri);
+    println!("→ aws ssm send-command (swap binary + restart systemd unit)");
+    run_ssm_redeploy(&cfg.tunnel.region, &bastion.instance_id, &script)?;
+
+    println!();
+    println!("✓ bastion-server redeployed on {}", bastion.instance_id);
+    Ok(())
+}
+
+fn run_ssm_redeploy(region: &str, instance_id: &str, script: &str) -> anyhow::Result<()> {
+    use std::process::Command;
+    use std::time::Duration;
+
+    let parameters = format!(
+        "commands={}",
+        serde_json::to_string(&vec![script.to_string()])?
+    );
+    let send = Command::new("aws")
+        .args([
+            "ssm",
+            "send-command",
+            "--region",
+            region,
+            "--instance-ids",
+            instance_id,
+            "--document-name",
+            "AWS-RunShellScript",
+            "--parameters",
+            &parameters,
+            "--query",
+            "Command.CommandId",
+            "--output",
+            "text",
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawning aws ssm send-command: {e}"))?;
+    if !send.status.success() {
+        return Err(anyhow::anyhow!(
+            "aws ssm send-command failed: {}",
+            String::from_utf8_lossy(&send.stderr).trim()
+        ));
+    }
+    let cmd_id = String::from_utf8_lossy(&send.stdout).trim().to_string();
+    if cmd_id.is_empty() {
+        return Err(anyhow::anyhow!("SSM send-command returned empty command id"));
+    }
+    println!("  SSM command id: {cmd_id}");
+
+    // Poll until terminal status. Bounded so a hung command doesn't
+    // wedge the whole flow.
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let status_out = Command::new("aws")
+            .args([
+                "ssm",
+                "get-command-invocation",
+                "--region",
+                region,
+                "--command-id",
+                &cmd_id,
+                "--instance-id",
+                instance_id,
+                "--query",
+                "Status",
+                "--output",
+                "text",
+            ])
+            .output();
+        let status = match status_out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!("SSM command status poll timed out"));
+                }
+                continue;
+            }
+        };
+        match status.as_str() {
+            "Success" => return Ok(()),
+            "Failed" | "Cancelled" | "TimedOut" => {
+                let body = Command::new("aws")
+                    .args([
+                        "ssm",
+                        "get-command-invocation",
+                        "--region",
+                        region,
+                        "--command-id",
+                        &cmd_id,
+                        "--instance-id",
+                        instance_id,
+                        "--query",
+                        "[StandardOutputContent,StandardErrorContent]",
+                        "--output",
+                        "text",
+                    ])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "SSM command ended with {status}:\n{body}"
+                ));
+            }
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "SSM command stuck in status {status} after 3 min"
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn bastion_status() -> anyhow::Result<()> {
