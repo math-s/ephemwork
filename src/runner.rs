@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,34 @@ impl Drop for RunningService {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Verify that `127.0.0.1:port` is free *right now*. Run at the top of
+/// the `up` flow so an orphan listener (e.g. a uvicorn from a previous
+/// `ephemwork up` that was killed before its child reaped) surfaces a
+/// clear error instead of letting the new spawn fail with a cryptic
+/// "address already in use" deep inside uvicorn's startup.
+///
+/// There's an unavoidable race between this check and the eventual
+/// `spawn_service` — another process could grab the port in between —
+/// but the common cause (your own previous run) is caught.
+pub fn assert_port_free(port: u16) -> Result<()> {
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            // Drop immediately so the actual service can bind shortly.
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(anyhow!(
+            "local port {port} is already in use — likely a leftover \
+             process from a previous `ephemwork up` that didn't shut down \
+             cleanly.\n\n  \
+             Find it:  lsof -nP -iTCP:{port} -sTCP:LISTEN\n  \
+             Kill it:  pkill -f \"uvicorn\\|node\\|<your run_command>\"\n  \
+             Then re-run ephemwork up."
+        )),
+        Err(e) => Err(e).with_context(|| format!("probing 127.0.0.1:{port}")),
     }
 }
 
@@ -247,6 +275,29 @@ mod tests {
                 || err.contains("timed out")
                 || err.contains("connection"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn assert_port_free_succeeds_when_port_is_free() {
+        // Bind 127.0.0.1:0, capture the port, drop the listener, then
+        // probe — the OS may reuse the port before something else grabs
+        // it, so the call should succeed.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        assert_port_free(port).expect("a just-released port should be probe-free");
+    }
+
+    #[test]
+    fn assert_port_free_errors_when_port_is_in_use() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let err = assert_port_free(port).unwrap_err().to_string();
+        assert!(err.contains("already in use"), "got: {err}");
+        assert!(
+            err.contains(&port.to_string()) && err.contains("lsof"),
+            "expected the message to include the port number and an lsof hint, got:\n{err}"
         );
     }
 

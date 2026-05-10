@@ -11,7 +11,9 @@ use crate::bastion_client::{self, BastionEndpoint};
 use crate::bastion_protocol::{DeregisterRequest, RegisterRequest};
 use crate::bastion_provisioner::{BastionContext, BastionProvisioner, InstanceSummary};
 use crate::config::{current_user, Config};
-use crate::runner::{spawn_service, wait_for_health, HealthCheck, RunningService};
+use crate::runner::{
+    assert_port_free, spawn_service, wait_for_health, HealthCheck, RunningService,
+};
 use crate::ssm::{
     assert_plugin_available, parse_forward_port_spec, start_port_forward,
     start_remote_host_forward, PortForwardSpec, RemoteHostForwardSpec, SsmTunnel,
@@ -279,6 +281,12 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     // Fail fast if the SSM plugin isn't installed: every port-forward
     // would otherwise just time out at 15s with no hint.
     assert_plugin_available().context("session-manager-plugin pre-flight")?;
+
+    // Fail fast if a previous run left a listener on the local service
+    // port; otherwise spawn_service ends up racing it and uvicorn (or
+    // similar) errors deep into startup with a cryptic EADDRINUSE.
+    assert_port_free(req.local_service_port)
+        .with_context(|| format!("local port for service {:?}", req.service))?;
 
     let mut provisioner =
         AwsBastionProvisioner::new(req.region.clone(), ctx.clone()).await?;
