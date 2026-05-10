@@ -98,19 +98,28 @@ Add `--live` once you've reviewed the plan.
 > The dry-run path, plan builders, and orchestration logic are fully
 > unit-tested.
 
-### 3. Add the ALB listener rule
+### 3. Add the ALB listener rules
 
 For an AWS CDK (Python) consumer, drop this into your existing
-`ApplicationLoadBalancer`'s listener:
+`ApplicationLoadBalancer`'s listener. **Read every comment** — three of
+the four caveats below cost real PRs to fix in production-adjacent infra
+during MotoCred adoption.
 
 ```python
 from aws_cdk import (
     aws_ec2 as ec2,
     aws_elasticloadbalancingv2 as elbv2,
-    aws_elasticloadbalancingv2_targets as targets,
+    aws_elasticloadbalancingv2_targets as elbv2_targets,
 )
 
-# 1. A target group whose targets are the bastion's private IP on :80.
+# 1. Target group: an IP target on the bastion's private IP, port 80.
+#
+# Caveat A — `availability_zone`: do NOT pass `availability_zone="all"`.
+# That option is ONLY valid for IPs *outside* the VPC (on-prem reached via
+# Direct Connect / VPN). For an in-VPC IP like the bastion's, ELB infers
+# the AZ from the route table; passing 'all' fails CFN with
+# `The IP address '...' is within the VPC, and cannot have its
+# Availability Zone overridden to 'all' from 'us-east-1a'`.
 bastion_target_group = elbv2.ApplicationTargetGroup(
     self,
     "EphemworkBastionTG",
@@ -118,16 +127,22 @@ bastion_target_group = elbv2.ApplicationTargetGroup(
     port=80,
     protocol=elbv2.ApplicationProtocol.HTTP,
     target_type=elbv2.TargetType.IP,
-    targets=[targets.IpTarget(bastion_private_ip)],
-    health_check=elbv2.HealthCheck(path="/ephemwork-health"),
+    targets=[elbv2_targets.IpTarget(bastion_private_ip, port=80)],
+    health_check=elbv2.HealthCheck(
+        path="/ephemwork-health",
+        healthy_http_codes="200",
+        interval=Duration.seconds(30),
+        timeout=Duration.seconds(5),
+    ),
 )
 
-# 2. A listener rule that intercepts only requests carrying X-Ephemwork.
+# 2. The main listener rule: route requests carrying X-Ephemwork to the
+#    bastion target group.
 elbv2.ApplicationListenerRule(
     self,
     "EphemworkRoute",
     listener=https_listener,
-    priority=10,                         # higher than the normal default
+    priority=10,                         # higher than the default catch-all
     conditions=[
         elbv2.ListenerCondition.http_header(
             "X-Ephemwork",
@@ -136,9 +151,79 @@ elbv2.ApplicationListenerRule(
     ],
     action=elbv2.ListenerAction.forward([bastion_target_group]),
 )
+
+# 3. CORS preflight routing. Browsers strip custom headers from OPTIONS
+#    preflights; instead they list them in `Access-Control-Request-Headers`.
+#    Without this rule the preflight goes to your normal backend (which
+#    may not list X-Ephemwork in its CORS allowlist), the browser blocks,
+#    and the actual request never fires. With this rule, preflights for
+#    X-Ephemwork-tagged requests also land on the bastion → laptop, so any
+#    CORS changes you make locally take effect immediately.
+elbv2.ApplicationListenerRule(
+    self,
+    "EphemworkCorsPreflightRoute",
+    listener=https_listener,
+    priority=11,
+    conditions=[
+        elbv2.ListenerCondition.http_header(
+            "Access-Control-Request-Headers",
+            ["*x-ephemwork*", "*X-Ephemwork*"],
+        ),
+    ],
+    action=elbv2.ListenerAction.forward([bastion_target_group]),
+)
+
+# 4. ALB SG egress to the bastion's SG.
+#
+# Caveat B — the `ApplicationLoadBalancedFargateService` pattern only
+# opens egress on its ALB SG to its own backend tasks. For a raw IP
+# target like the bastion's, CDK can't infer the destination SG, so no
+# egress rule is added. Without this, the target health check times out
+# and the ALB never forwards. The bastion's SG ID is what
+# `ephemwork bastion init --live` printed (or fetch from CFN).
+bastion_sg = ec2.SecurityGroup.from_security_group_id(
+    self,
+    "EphemworkBastionSG",
+    bastion_security_group_id,
+    mutable=False,                       # owned by the ephemwork CLI
+)
+service.load_balancer.connections.allow_to(
+    bastion_sg,
+    ec2.Port.tcp(80),
+    "ALB to ephemwork bastion (X-Ephemwork header)",
+)
 ```
 
-Requests **without** the header fall through to your existing rules unchanged.
+Requests **without** `X-Ephemwork` fall through to your existing rules
+unchanged. Production stays untouched as long as you gate the entire
+block on a per-environment config flag (e.g. only set `bastion_private_ip`
+for staging).
+
+### 3a. Allow `X-Ephemwork` in your back-end's CORS allowlist
+
+Your back-end's CORS middleware must include `X-Ephemwork` in its
+`allow_headers` list, otherwise the browser preflight from the staging FE
+returns `400 Disallowed CORS headers` even when the listener rules above
+are correct. For FastAPI:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[...],
+    allow_methods=[...],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        # ... your existing headers ...
+        "X-Ephemwork",                   # <-- add this
+    ],
+)
+```
+
+This change is safe for production: the FE only sets `X-Ephemwork` in
+staging (gate the widget on `VITE_SENTRY_ENVIRONMENT === "staging"` or
+similar), so prod traffic never carries the header even when the
+allow_headers list contains it.
 
 ### 4. Set the header in the staging UI
 
