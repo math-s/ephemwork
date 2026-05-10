@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::handlers::{route, MutationListener, NoopListener};
-use crate::http::{read_request, write_response};
+use crate::http::{read_request, write_response, RequestError};
 use crate::nginx::{NginxReloader, ReloadCommand};
 use crate::registry::{default_registry_path, Registry};
 
@@ -97,7 +97,18 @@ fn handle_connection(
     registry: Arc<Mutex<Registry>>,
     cfg: ServerConfig,
 ) -> Result<()> {
-    let request = read_request(&mut stream)?;
+    let request = match read_request(&mut stream) {
+        Ok(req) => req,
+        Err(RequestError::EmptyConnection) => {
+            // Port scanner / TCP-only health check / etc. Silent — these
+            // are common background noise on a public-ish ALB target.
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(%e, "rejecting malformed connection");
+            return Ok(());
+        }
+    };
     let mut listener = composite_listener(&cfg);
     let response = {
         let mut reg = registry.lock().expect("registry mutex poisoned");
