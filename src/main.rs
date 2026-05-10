@@ -174,9 +174,57 @@ async fn bastion_init(args: BastionInitArgs) -> anyhow::Result<()> {
         "bastion {verb}: instance={} security_group={}",
         outcome.instance_id, outcome.security_group_id
     );
-    if !outcome.reused {
+
+    // Post-flight: detect VPC interface endpoints whose SGs don't allow
+    // the bastion → :443. The bastion's SSM agent silently fails to
+    // register against those endpoints (DNS resolves to private IPs that
+    // the bastion can't reach), and `aws ssm describe-instance-information`
+    // never lists the instance. Don't auto-mutate shared infra; print the
+    // exact authorize-security-group-ingress commands and let the operator
+    // run them.
+    if let Some(vpc_id) = cfg.tunnel.expected_vpc_id.as_deref() {
+        match provisioner
+            .missing_vpc_endpoint_ingress(vpc_id, &outcome.security_group_id)
+            .await
+        {
+            Ok(missing) if missing.is_empty() => {
+                println!("VPC endpoint SGs already allow the bastion. ✓");
+            }
+            Ok(missing) => {
+                println!();
+                println!(
+                    "⚠  {} VPC interface endpoint security group(s) don't allow inbound \
+                     :443 from the bastion's SG. The bastion's SSM agent will fail to \
+                     register until you add these rules:",
+                    missing.len()
+                );
+                println!();
+                let profile = std::env::var("AWS_PROFILE").ok();
+                for m in &missing {
+                    println!("  # {}", m.endpoint_service);
+                    println!(
+                        "  {}",
+                        m.fix_command(&outcome.security_group_id, profile.as_deref())
+                            .replace('\n', "\n  ")
+                    );
+                    println!();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "VPC endpoint SG check failed; skipping");
+            }
+        }
+    } else {
         println!(
-            "next: add the ALB listener rule documented in README.md, then \
+            "(skipping VPC endpoint SG check; set tunnel.expected_vpc_id in \
+             ephemwork.toml to enable.)"
+        );
+    }
+
+    if !outcome.reused {
+        println!();
+        println!(
+            "next: add the ALB listener rules documented in README.md, then \
              `ephemwork up <service>`."
         );
     }

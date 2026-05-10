@@ -50,6 +50,81 @@ impl AwsBastionProvisioner {
         block_in_place(|| self.handle.block_on(fut))
     }
 
+    /// Enumerate interface VPC endpoints in `vpc_id` whose security
+    /// groups don't allow inbound :443 from `bastion_sg_id`. Run after
+    /// `bastion init --live` to catch the silent SSM-can't-reach-endpoint
+    /// failure mode early instead of after a 5-minute "instance never
+    /// joined SSM" wait.
+    pub async fn missing_vpc_endpoint_ingress(
+        &self,
+        vpc_id: &str,
+        bastion_sg_id: &str,
+    ) -> Result<Vec<MissingEndpointIngress>> {
+        use aws_sdk_ec2::types::VpcEndpointType;
+
+        let resp = self
+            .ec2
+            .describe_vpc_endpoints()
+            .filters(Filter::builder().name("vpc-id").values(vpc_id).build())
+            .send()
+            .await
+            .with_context(|| format!("describe_vpc_endpoints {vpc_id}"))?;
+
+        let endpoints = resp.vpc_endpoints.unwrap_or_default();
+        // De-dupe SG IDs across endpoints so we issue one
+        // describe_security_groups per group, not one per endpoint.
+        let mut groups_to_check: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for ep in &endpoints {
+            if ep.vpc_endpoint_type != Some(VpcEndpointType::Interface) {
+                continue;
+            }
+            let service = ep.service_name.clone().unwrap_or_default();
+            for group in ep.groups.clone().unwrap_or_default() {
+                if let Some(gid) = group.group_id {
+                    groups_to_check.entry(gid).or_insert_with(|| service.clone());
+                }
+            }
+        }
+
+        let mut missing = Vec::new();
+        for (sg_id, service) in groups_to_check {
+            let perms = self.security_group_ingress(&sg_id).await?;
+            if !ingress_allows(&perms, bastion_sg_id, 443) {
+                missing.push(MissingEndpointIngress {
+                    endpoint_sg_id: sg_id,
+                    endpoint_service: service,
+                    port: 443,
+                });
+            }
+        }
+        // Stable order so the printed warnings don't shuffle between runs.
+        missing.sort_by(|a, b| {
+            a.endpoint_service
+                .cmp(&b.endpoint_service)
+                .then_with(|| a.endpoint_sg_id.cmp(&b.endpoint_sg_id))
+        });
+        Ok(missing)
+    }
+
+    async fn security_group_ingress(
+        &self,
+        sg_id: &str,
+    ) -> Result<Vec<aws_sdk_ec2::types::IpPermission>> {
+        let resp = self
+            .ec2
+            .describe_security_groups()
+            .group_ids(sg_id)
+            .send()
+            .await
+            .with_context(|| format!("describe_security_groups {sg_id}"))?;
+        let group = resp
+            .security_groups
+            .and_then(|v| v.into_iter().next())
+            .ok_or_else(|| anyhow!("security group {sg_id} not found"))?;
+        Ok(group.ip_permissions.unwrap_or_default())
+    }
+
     /// Look up which VPC the subnet lives in. Used by the prod-safety guard
     /// in `bastion init --live` to refuse a subnet from the wrong VPC before
     /// any resource is created.
@@ -432,6 +507,70 @@ fn build_tag_spec(tags: &[(String, String)]) -> TagSpecification {
         .build()
 }
 
+/// One VPC endpoint whose security group doesn't allow inbound from the
+/// bastion's SG. The bastion's SSM agent (and any other service that
+/// resolves a public hostname to a private interface endpoint via VPC
+/// DNS) silently fails until the missing rule is added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingEndpointIngress {
+    /// Security group attached to the endpoint's ENI.
+    pub endpoint_sg_id: String,
+    /// Service the endpoint exposes (e.g. `com.amazonaws.us-east-1.ssm`).
+    pub endpoint_service: String,
+    /// Port the bastion needs to reach the endpoint on (always 443 for
+    /// AWS interface endpoints today, kept here for clarity in error
+    /// messages).
+    pub port: u16,
+}
+
+impl MissingEndpointIngress {
+    /// Render the exact `aws ec2 authorize-security-group-ingress` command
+    /// the operator should run. Designed to be copy-pasted into a shell.
+    pub fn fix_command(&self, bastion_sg_id: &str, profile: Option<&str>) -> String {
+        let profile_arg = profile
+            .map(|p| format!(" --profile {p}"))
+            .unwrap_or_default();
+        format!(
+            "aws ec2 authorize-security-group-ingress{profile_arg} \\\n  \
+               --group-id {endpoint_sg} \\\n  \
+               --ip-permissions 'IpProtocol=tcp,FromPort={port},ToPort={port},\
+                                 UserIdGroupPairs=[{{GroupId={bastion_sg},Description=\"ephemwork bastion\"}}]'",
+            endpoint_sg = self.endpoint_sg_id,
+            port = self.port,
+            bastion_sg = bastion_sg_id,
+        )
+    }
+}
+
+/// Pure check: given an SG's ingress permissions, does any of them allow
+/// `port` from `source_sg_id`? Public so tests pin the rule semantics
+/// without touching the AWS SDK.
+pub fn ingress_allows(
+    perms: &[aws_sdk_ec2::types::IpPermission],
+    source_sg_id: &str,
+    port: u16,
+) -> bool {
+    let port_i = port as i32;
+    for p in perms {
+        if p.ip_protocol() != Some("tcp") {
+            continue;
+        }
+        let from = p.from_port().unwrap_or(-1);
+        let to = p.to_port().unwrap_or(-1);
+        if from > port_i || to < port_i {
+            continue;
+        }
+        if p
+            .user_id_group_pairs()
+            .iter()
+            .any(|pair| pair.group_id() == Some(source_sg_id))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Pure check for the prod-safety guard. Public so tests can pin the error
 /// shape without making any AWS calls.
 pub fn verify_vpc_match(subnet_id: &str, actual_vpc: &str, expected_vpc: &str) -> Result<()> {
@@ -501,6 +640,90 @@ mod tests {
                 "unexpected char {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn ingress_allows_matches_exact_port_and_sg() {
+        use aws_sdk_ec2::types::{IpPermission, UserIdGroupPair};
+        let perm = IpPermission::builder()
+            .ip_protocol("tcp")
+            .from_port(443)
+            .to_port(443)
+            .user_id_group_pairs(
+                UserIdGroupPair::builder().group_id("sg-bastion").build(),
+            )
+            .build();
+        assert!(ingress_allows(&[perm.clone()], "sg-bastion", 443));
+        assert!(!ingress_allows(&[perm.clone()], "sg-other", 443));
+        assert!(!ingress_allows(&[perm], "sg-bastion", 5432));
+    }
+
+    #[test]
+    fn ingress_allows_matches_inside_port_range() {
+        use aws_sdk_ec2::types::{IpPermission, UserIdGroupPair};
+        let perm = IpPermission::builder()
+            .ip_protocol("tcp")
+            .from_port(400)
+            .to_port(500)
+            .user_id_group_pairs(
+                UserIdGroupPair::builder().group_id("sg-bastion").build(),
+            )
+            .build();
+        assert!(ingress_allows(&[perm.clone()], "sg-bastion", 443));
+        assert!(!ingress_allows(&[perm], "sg-bastion", 501));
+    }
+
+    #[test]
+    fn ingress_allows_rejects_non_tcp() {
+        use aws_sdk_ec2::types::{IpPermission, UserIdGroupPair};
+        let udp = IpPermission::builder()
+            .ip_protocol("udp")
+            .from_port(443)
+            .to_port(443)
+            .user_id_group_pairs(
+                UserIdGroupPair::builder().group_id("sg-bastion").build(),
+            )
+            .build();
+        assert!(!ingress_allows(&[udp], "sg-bastion", 443));
+    }
+
+    #[test]
+    fn ingress_allows_rejects_cidr_only_rule() {
+        use aws_sdk_ec2::types::{IpPermission, IpRange};
+        let perm = IpPermission::builder()
+            .ip_protocol("tcp")
+            .from_port(443)
+            .to_port(443)
+            .ip_ranges(IpRange::builder().cidr_ip("10.0.0.0/8").build())
+            .build();
+        // CIDR-only rules don't grant SG access.
+        assert!(!ingress_allows(&[perm], "sg-bastion", 443));
+    }
+
+    #[test]
+    fn missing_endpoint_ingress_renders_copy_pasteable_fix() {
+        let m = MissingEndpointIngress {
+            endpoint_sg_id: "sg-endpoint".into(),
+            endpoint_service: "com.amazonaws.us-east-1.ssm".into(),
+            port: 443,
+        };
+        let cmd = m.fix_command("sg-bastion", Some("motocred"));
+        assert!(cmd.starts_with("aws ec2 authorize-security-group-ingress"));
+        assert!(cmd.contains("--profile motocred"));
+        assert!(cmd.contains("--group-id sg-endpoint"));
+        assert!(cmd.contains("FromPort=443,ToPort=443"));
+        assert!(cmd.contains("GroupId=sg-bastion"));
+    }
+
+    #[test]
+    fn missing_endpoint_ingress_omits_profile_when_unset() {
+        let m = MissingEndpointIngress {
+            endpoint_sg_id: "sg-x".into(),
+            endpoint_service: "any".into(),
+            port: 443,
+        };
+        let cmd = m.fix_command("sg-y", None);
+        assert!(!cmd.contains("--profile"));
     }
 
     #[test]
