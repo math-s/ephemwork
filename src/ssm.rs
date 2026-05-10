@@ -91,6 +91,45 @@ pub fn build_start_session_args(spec: &PortForwardSpec, local_port: u16) -> Vec<
     ]
 }
 
+/// Verify that `aws ssm start-session` will be able to open a websocket.
+/// AWS CLI shells out to `session-manager-plugin` to do the actual work;
+/// without it, every port-forward times out at 15 s with a vague "did not
+/// become reachable" error. Pre-flighting catches the missing dependency
+/// at the top of the `up` flow with a helpful install hint instead.
+pub fn assert_plugin_available() -> Result<String> {
+    assert_plugin_available_at("session-manager-plugin")
+}
+
+/// Same as [`assert_plugin_available`] but takes an explicit binary path
+/// so unit tests can exercise the missing-binary error path without
+/// touching `PATH`.
+pub fn assert_plugin_available_at(binary: &str) -> Result<String> {
+    match Command::new(binary).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Err(anyhow::anyhow!(
+            "`{binary} --version` exited with {:?} ({}). \
+             The plugin is on PATH but not working; reinstall it.",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(plugin_install_hint(binary, &e)),
+    }
+}
+
+fn plugin_install_hint(binary: &str, source: &std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ephemwork needs the AWS Session Manager plugin on PATH but couldn't \
+         run `{binary} --version`: {source}.\n\n\
+         Install:\n  \
+           macOS:        sudo brew install --cask session-manager-plugin\n  \
+           Linux (deb):  curl -O https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb \\\n  \
+                         && sudo dpkg -i session-manager-plugin.deb\n  \
+           Other:        https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+    )
+}
+
 /// Spawn `aws ssm start-session` and return a guard that kills the child on
 /// drop. The caller can then connect to `127.0.0.1:<local_port>` as if it
 /// were the remote port on the target instance.
@@ -320,5 +359,16 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(!alive, "child {pid} should have been killed by drop");
+    }
+
+    #[test]
+    fn assert_plugin_available_at_errors_with_install_hint_on_missing_binary() {
+        let err = assert_plugin_available_at("ephemwork-no-such-binary-xyz123")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Install:") && err.contains("session-manager-plugin"),
+            "expected an install hint, got:\n{err}"
+        );
     }
 }
