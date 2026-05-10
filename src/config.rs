@@ -117,11 +117,6 @@ impl Config {
             if svc.run_command.trim().is_empty() {
                 return Err(anyhow!("service.{name}: run_command must not be empty"));
             }
-            if svc.port.is_none() && !svc.forward_ports.is_empty() {
-                return Err(anyhow!(
-                    "service.{name}: forward_ports requires `port` (worker services don't open SSM tunnels — run an HTTP service alongside to share its tunnels)"
-                ));
-            }
         }
         Ok(())
     }
@@ -291,7 +286,13 @@ run_command = "uv run python -m app.lambdas.run_local engine_worker"
     }
 
     #[test]
-    fn validate_rejects_worker_with_forward_ports() {
+    fn validate_accepts_worker_with_forward_ports() {
+        // Workers can declare forward_ports so they can talk to staging
+        // RDS / private hosts on their own, without an HTTP service
+        // running. Only one ephemwork session can hold a given local
+        // port at a time, so running api + worker that both forward
+        // 5432 will fail at runtime — that's a different validation
+        // concern (assert_port_free in up_service).
         let toml = r#"
 [tunnel]
 type = "ec2"
@@ -304,8 +305,9 @@ run_command = "x"
 forward_ports = ["5432:db.example.com:5432"]
 "#;
         let cfg = Config::from_toml_str(toml).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("forward_ports requires `port`"), "got: {err}");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.service["engine-worker"].port, None);
+        assert_eq!(cfg.service["engine-worker"].forward_ports.len(), 1);
     }
 
     #[test]
