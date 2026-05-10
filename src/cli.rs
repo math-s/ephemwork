@@ -47,6 +47,11 @@ pub enum BastionCommand {
     /// systemd unit on the running bastion. Use after editing
     /// bastion-server code to push changes without re-provisioning.
     Redeploy(BastionRedeployArgs),
+    /// Run a deep diagnostic against the bastion: instance state,
+    /// SSM-agent registration, and VPC endpoint SG ingress. Useful when
+    /// `ephemwork up` is failing in a way you can't immediately
+    /// pinpoint.
+    Doctor,
 }
 
 #[derive(Args, Debug)]
@@ -265,6 +270,12 @@ mod tests {
             cli.command,
             Command::Bastion(BastionCommand::Status)
         ));
+    }
+
+    #[test]
+    fn bastion_doctor_parses() {
+        let cli = parse(&["ephemwork", "bastion", "doctor"]);
+        assert!(matches!(cli.command, Command::Bastion(BastionCommand::Doctor)));
     }
 
     #[test]
