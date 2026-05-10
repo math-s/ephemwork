@@ -73,10 +73,21 @@ async fn up(args: UpArgs) -> anyhow::Result<()> {
     // forward dies (network blip, bastion restart, suspend/resume), keeping
     // ephemwork running just means the bastion's nginx 502s every tagged
     // request — surface the death immediately so the developer can re-run.
+    //
+    // SIGTERM gets the same handling as Ctrl-C: pkill / launchd-style stop
+    // / shell-script cleanup all use SIGTERM by default, and without this
+    // arm the process gets SIGKILL'd before Drop runs and uvicorn etc.
+    // descendants survive (defeating the process-group cleanup).
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
     let exit_reason = tokio::select! {
         result = tokio::signal::ctrl_c() => {
             result?;
             "ctrl-c"
+        }
+        _ = sigterm.recv() => {
+            "sigterm"
         }
         _ = wait_for_tunnel_death(&session) => {
             "tunnel-died"

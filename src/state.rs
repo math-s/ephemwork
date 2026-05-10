@@ -12,6 +12,16 @@ pub struct Session {
     pub local_port: u16,
     pub remote_port: u16,
     pub pid: Option<u32>,
+
+    /// Local ports for `forward_ports` SSM tunnels this session opened.
+    /// A sibling session (same user) that declares a forward on the same
+    /// local port reuses the existing tunnel instead of opening another
+    /// one — see `commands::up_service` for the reuse logic.
+    /// Sessions started before this field existed deserialize with an
+    /// empty vec; their forwards aren't sharable, but they still work
+    /// for the session that owns them.
+    #[serde(default)]
+    pub forward_local_ports: Vec<u16>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +88,17 @@ impl State {
     pub fn for_user<'a>(&'a self, user: &'a str) -> impl Iterator<Item = &'a Session> + 'a {
         self.sessions.iter().filter(move |s| s.user == user)
     }
+
+    /// Find the session (if any) that owns the SSM forward to
+    /// `127.0.0.1:local_port` for `user`. Caller is responsible for
+    /// verifying the owner's pid is still alive — a stale entry
+    /// (process crashed without cleanup) would otherwise be reused
+    /// even though the underlying tunnel is dead.
+    pub fn forward_owner(&self, user: &str, local_port: u16) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .find(|s| s.user == user && s.forward_local_ports.contains(&local_port))
+    }
 }
 
 /// Default location: `$HOME/.ephemwork/state.json`. Override with
@@ -108,6 +129,7 @@ mod tests {
             local_port: port,
             remote_port: 9000 + port,
             pid: Some(1234),
+            forward_local_ports: Vec::new(),
         }
     }
 
@@ -185,6 +207,55 @@ mod tests {
         assert_eq!(removed[0].service, "api");
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].service, "worker");
+    }
+
+    #[test]
+    fn forward_owner_finds_session_owning_local_port() {
+        let mut state = State::default();
+        let mut sess = sample("alice", "api", 8000);
+        sess.forward_local_ports = vec![5432, 6379];
+        state.upsert(sess);
+        state.upsert(sample("alice", "worker", 8001));
+        let owner = state.forward_owner("alice", 5432);
+        assert!(owner.is_some());
+        assert_eq!(owner.unwrap().service, "api");
+    }
+
+    #[test]
+    fn forward_owner_scoped_by_user() {
+        let mut state = State::default();
+        let mut alice = sample("alice", "api", 8000);
+        alice.forward_local_ports = vec![5432];
+        state.upsert(alice);
+        // Bob declares the same forward port — alice's session must NOT
+        // be returned as the owner for bob's lookup.
+        assert!(state.forward_owner("bob", 5432).is_none());
+        assert!(state.forward_owner("alice", 5432).is_some());
+    }
+
+    #[test]
+    fn forward_owner_returns_none_when_not_recorded() {
+        let mut state = State::default();
+        state.upsert(sample("alice", "api", 8000));
+        assert!(state.forward_owner("alice", 5432).is_none());
+    }
+
+    #[test]
+    fn session_with_no_forward_local_ports_deserializes() {
+        // Backwards-compat: state files written before this field existed
+        // must still load. The default is an empty vec.
+        let raw = r#"{
+            "sessions": [{
+                "user": "alice",
+                "service": "api",
+                "started_at": "2026-05-08T12:00:00Z",
+                "local_port": 8000,
+                "remote_port": 9000,
+                "pid": 1234
+            }]
+        }"#;
+        let state: State = serde_json::from_str(raw).unwrap();
+        assert!(state.sessions[0].forward_local_ports.is_empty());
     }
 
     #[test]
