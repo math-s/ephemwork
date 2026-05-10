@@ -50,14 +50,22 @@ async fn up(args: UpArgs) -> anyhow::Result<()> {
 
     println!();
     println!("✓ {} is live.", session.service);
-    println!("  set this header on staging requests to route to your laptop:");
-    println!();
-    println!("    {}", session.header_line());
-    println!();
-    println!(
-        "  pid={}  local:{}  bastion-port:{}",
-        session.pid, session.local_port, session.remote_port
-    );
+    match (session.local_port, session.remote_port) {
+        (Some(local), Some(remote)) => {
+            println!("  set this header on staging requests to route to your laptop:");
+            println!();
+            println!("    {}", session.header_line());
+            println!();
+            println!(
+                "  pid={}  local:{}  bastion-port:{}",
+                session.pid, local, remote
+            );
+        }
+        _ => {
+            println!("  worker mode: no inbound HTTP routing.");
+            println!("  pid={}", session.pid);
+        }
+    }
     println!();
     println!("Press Ctrl-C to stop.");
 

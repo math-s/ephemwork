@@ -26,3 +26,12 @@ health_check_path = "/health"
 [service.worker]
 port = 9090
 run_command = "python worker.py"
+
+# Worker service: no inbound HTTP routing. Omit `port` (or set to 0 — the
+# CLI rejects 0 with a clear error pointing here). ephemwork just runs
+# bootstrap_command + run_command. Use this for SQS pollers, cron jobs,
+# or anything that talks to AWS directly without receiving HTTP from the
+# staging ALB. Workers can't declare forward_ports; run an HTTP service
+# alongside (e.g. `ephemwork up api`) to share its tunnels.
+[service.engine-worker]
+run_command = "uv run python -m app.lambdas.run_local engine_worker"

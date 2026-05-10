@@ -182,7 +182,11 @@ pub struct UpRequest {
     pub user: String,
     pub service: String,
     pub region: String,
-    pub local_service_port: u16,
+    /// Port the local service listens on. `None` means worker mode:
+    /// no inbound HTTP routing, no bastion registration, no SSH reverse
+    /// tunnel. ephemwork just runs `bootstrap_command` then
+    /// `run_command` and watches the child process.
+    pub local_service_port: Option<u16>,
     pub run_command: String,
     pub health_check_path: Option<String>,
     pub ssh_username: String,
@@ -228,8 +232,10 @@ impl UpRequest {
 pub struct ActiveSession {
     pub user: String,
     pub service: String,
-    pub local_port: u16,
-    pub remote_port: u16,
+    /// `None` for worker services (no inbound routing).
+    pub local_port: Option<u16>,
+    /// `None` for worker services (no bastion registration).
+    pub remote_port: Option<u16>,
     pub pid: u32,
 
     /// Order matters: drop the SSH reverse forward first (closes the
@@ -244,7 +250,8 @@ pub struct ActiveSession {
     forward_ssm: Vec<SsmTunnel>,
 
     /// Endpoint of the control-plane port forward, used for deregistration.
-    cp_endpoint: BastionEndpoint,
+    /// `None` for worker services (no control plane was opened).
+    cp_endpoint: Option<BastionEndpoint>,
 }
 
 impl ActiveSession {
@@ -268,8 +275,9 @@ impl ActiveSession {
     /// errors because Drop semantics already kill the children if anything
     /// fails — we just want the bastion's view to match.
     pub fn shutdown(mut self) {
-        let endpoint = self.cp_endpoint.clone();
-        deregister_best_effort(&endpoint, &self.user, &self.service);
+        if let Some(endpoint) = self.cp_endpoint.clone() {
+            deregister_best_effort(&endpoint, &self.user, &self.service);
+        }
         // Take + drop in dependency order.
         let _ = self.reverse.take();
         let _ = self.runner.take();
@@ -283,6 +291,14 @@ impl ActiveSession {
 /// nothing on its own; the caller (typically main) decides whether to keep
 /// the returned `ActiveSession` alive (foreground UX) or hand it off.
 pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession> {
+    // Worker services (no inbound port) skip the entire bastion path:
+    // no SSM tunnels, no SSH reverse forward, no ALB rule. They just
+    // run bootstrap_command + run_command and rely on whatever AWS
+    // tunnels a sibling HTTP service has opened (e.g. `up api`).
+    let Some(local_service_port) = req.local_service_port else {
+        return up_worker(req).await;
+    };
+
     // Fail fast if the SSM plugin isn't installed: every port-forward
     // would otherwise just time out at 15s with no hint.
     assert_plugin_available().context("session-manager-plugin pre-flight")?;
@@ -290,7 +306,7 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     // Fail fast if a previous run left a listener on the local service
     // port; otherwise spawn_service ends up racing it and uvicorn (or
     // similar) errors deep into startup with a cryptic EADDRINUSE.
-    assert_port_free(req.local_service_port)
+    assert_port_free(local_service_port)
         .with_context(|| format!("local port for service {:?}", req.service))?;
 
     // Project-supplied bootstrap (e.g. hydrate .env.staging from Secrets
@@ -361,7 +377,7 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     if let Some(path) = &req.health_check_path {
         wait_for_health(&HealthCheck {
             host: "127.0.0.1",
-            port: req.local_service_port,
+            port: local_service_port,
             path,
             overall_timeout: req.health_timeout,
             poll_interval: Duration::from_millis(250),
@@ -382,7 +398,7 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
             auth: SshAuth::Agent,
             keepalive: req.ssh_keepalive,
         },
-        req.local_service_port,
+        local_service_port,
         remote_port,
     )?;
 
@@ -390,7 +406,7 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     let session = session_for(
         &req.user,
         &req.service,
-        req.local_service_port,
+        local_service_port,
         remote_port,
         Some(pid),
     );
@@ -399,15 +415,46 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     Ok(ActiveSession {
         user: req.user,
         service: req.service,
-        local_port: req.local_service_port,
-        remote_port,
+        local_port: Some(local_service_port),
+        remote_port: Some(remote_port),
         pid,
         reverse: Some(reverse),
         runner: Some(service),
         ssh_ssm: Some(ssh_ssm),
         cp_ssm: Some(cp_ssm),
         forward_ssm,
-        cp_endpoint,
+        cp_endpoint: Some(cp_endpoint),
+    })
+}
+
+/// Worker-mode `up`: bootstrap_command + run_command, no bastion.
+/// Returns once `run_command` is spawned. The caller awaits the child
+/// process via `ActiveSession`.
+async fn up_worker(req: UpRequest) -> Result<ActiveSession> {
+    if let Some(cmd) = req.bootstrap_command.as_deref() {
+        tracing::info!(bootstrap = %cmd, "running bootstrap_command");
+        run_bootstrap(cmd).context("bootstrap_command")?;
+    }
+
+    let service = spawn_service(&req.run_command, Stdio::inherit(), Stdio::inherit())?;
+    let pid = service.pid;
+
+    // local_port=0/remote_port=0 in state.json marks this as a worker.
+    let session = session_for(&req.user, &req.service, 0, 0, Some(pid));
+    record_session(&default_state_path()?, session)?;
+
+    Ok(ActiveSession {
+        user: req.user,
+        service: req.service,
+        local_port: None,
+        remote_port: None,
+        pid,
+        reverse: None,
+        runner: Some(service),
+        ssh_ssm: None,
+        cp_ssm: None,
+        forward_ssm: Vec::new(),
+        cp_endpoint: None,
     })
 }
 
@@ -517,7 +564,7 @@ mod tests {
             service.insert(
                 (*name).into(),
                 ServiceConfig {
-                    port: *port,
+                    port: Some(*port),
                     build_command: None,
                     run_command: "x".into(),
                     health_check_path: None,
@@ -552,7 +599,7 @@ mod tests {
     fn lookup_service_returns_match() {
         let cfg = cfg_with(&[("api", 8000), ("worker", 9000)]);
         let svc = lookup_service(&cfg, "api").unwrap();
-        assert_eq!(svc.port, 8000);
+        assert_eq!(svc.port, Some(8000));
     }
 
     #[test]
@@ -641,7 +688,7 @@ mod tests {
         assert_eq!(req.user, "matheus");
         assert_eq!(req.service, "api");
         assert_eq!(req.region, "us-east-1");
-        assert_eq!(req.local_service_port, 8000);
+        assert_eq!(req.local_service_port, Some(8000));
         assert_eq!(req.run_command, "x");
         assert_eq!(req.health_check_path, None);
         assert_eq!(req.ssh_username, UpRequest::DEFAULT_SSH_USERNAME);
@@ -673,6 +720,23 @@ mod tests {
         let cfg = cfg_with(&[("api", 8000)]);
         let req = UpRequest::from_config(&cfg, "api", "matheus").unwrap();
         assert!(req.bootstrap_command.is_none());
+    }
+
+    #[test]
+    fn up_request_propagates_some_port_for_http_service() {
+        let cfg = cfg_with(&[("api", 8000)]);
+        let req = UpRequest::from_config(&cfg, "api", "matheus").unwrap();
+        assert_eq!(req.local_service_port, Some(8000));
+    }
+
+    #[test]
+    fn up_request_propagates_none_port_for_worker_service() {
+        let mut cfg = cfg_with(&[("engine", 1234)]);
+        // Simulate a worker service: omit the port. cfg_with requires a
+        // u16, so reach in and clear it after construction.
+        cfg.service.get_mut("engine").unwrap().port = None;
+        let req = UpRequest::from_config(&cfg, "engine", "matheus").unwrap();
+        assert!(req.local_service_port.is_none());
     }
 
     #[test]
@@ -724,17 +788,82 @@ mod tests {
         let sess = ActiveSession {
             user: "matheus".into(),
             service: "api".into(),
-            local_port: 8000,
-            remote_port: 9001,
+            local_port: Some(8000),
+            remote_port: Some(9001),
             pid: 42,
             reverse: None,
             runner: None,
             ssh_ssm: None,
             cp_ssm: None,
             forward_ssm: Vec::new(),
-            cp_endpoint: BastionEndpoint::new("127.0.0.1", 5555),
+            cp_endpoint: Some(BastionEndpoint::new("127.0.0.1", 5555)),
         };
         assert_eq!(sess.header_value(), "matheus:api");
         assert_eq!(sess.header_line(), "X-Ephemwork: matheus:api");
+    }
+
+    #[tokio::test]
+    async fn up_worker_runs_command_without_bastion() {
+        // Spawn a worker that prints to stdout and exits; ephemwork
+        // doesn't supervise the process state in this unit test, but
+        // the side effect (the file written by `sh -c`) proves the
+        // run_command actually fired and the bootstrap_command ran
+        // first. No bastion, no SSM, no SSH — purely local.
+        let dir = tempdir().unwrap();
+        let bootstrap_marker = dir.path().join("bootstrap.txt");
+        let run_marker = dir.path().join("run.txt");
+
+        let req = UpRequest {
+            user: "matheus".into(),
+            service: "engine-worker".into(),
+            region: "us-east-1".into(),
+            local_service_port: None,
+            run_command: format!("touch {} && sleep 0.05", run_marker.display()),
+            health_check_path: None,
+            ssh_username: UpRequest::DEFAULT_SSH_USERNAME.into(),
+            ssh_keepalive: Duration::from_secs(30),
+            health_timeout: Duration::from_secs(5),
+            forward_ports: Vec::new(),
+            bootstrap_command: Some(format!("touch {}", bootstrap_marker.display())),
+        };
+        let session = up_worker(req).await.unwrap();
+
+        // bootstrap_command runs synchronously before run_command; its
+        // marker must exist by the time up_worker returns.
+        assert!(bootstrap_marker.exists(), "bootstrap marker missing");
+        assert!(session.local_port.is_none());
+        assert!(session.remote_port.is_none());
+        assert!(session.cp_endpoint.is_none());
+        assert!(session.reverse.is_none());
+
+        // Give the spawned `touch` a moment to land before we tear down.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(run_marker.exists(), "run marker missing");
+
+        // Worker shutdown must not call deregister (cp_endpoint is None).
+        // If it did, this would try to talk to localhost:0 and panic.
+        session.shutdown();
+    }
+
+    #[tokio::test]
+    async fn up_worker_aborts_on_failed_bootstrap() {
+        let req = UpRequest {
+            user: "matheus".into(),
+            service: "engine-worker".into(),
+            region: "us-east-1".into(),
+            local_service_port: None,
+            run_command: "true".into(),
+            health_check_path: None,
+            ssh_username: UpRequest::DEFAULT_SSH_USERNAME.into(),
+            ssh_keepalive: Duration::from_secs(30),
+            health_timeout: Duration::from_secs(5),
+            forward_ports: Vec::new(),
+            bootstrap_command: Some("exit 7".into()),
+        };
+        let err = match up_worker(req).await {
+            Ok(_) => panic!("expected bootstrap_command failure"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("bootstrap_command"), "got: {err}");
     }
 }
