@@ -31,7 +31,11 @@ run_command = "python worker.py"
 # CLI rejects 0 with a clear error pointing here). ephemwork just runs
 # bootstrap_command + run_command. Use this for SQS pollers, cron jobs,
 # or anything that talks to AWS directly without receiving HTTP from the
-# staging ALB. Workers can't declare forward_ports; run an HTTP service
-# alongside (e.g. `ephemwork up api`) to share its tunnels.
+# staging ALB. Workers MAY declare forward_ports — they get the same
+# SSM tunnels through the bastion that an HTTP service would. Note
+# that ephemwork sessions don't share local ports: if `up api` is
+# already forwarding 5432, a worker that also forwards 5432 will fail
+# at startup. Run them one at a time, or stagger their local ports.
 [service.engine-worker]
 run_command = "uv run python -m app.lambdas.run_local engine_worker"
+forward_ports = ["5432:db.staging.local:5432"]

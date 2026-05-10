@@ -291,12 +291,12 @@ impl ActiveSession {
 /// nothing on its own; the caller (typically main) decides whether to keep
 /// the returned `ActiveSession` alive (foreground UX) or hand it off.
 pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession> {
-    // Worker services (no inbound port) skip the entire bastion path:
-    // no SSM tunnels, no SSH reverse forward, no ALB rule. They just
-    // run bootstrap_command + run_command and rely on whatever AWS
-    // tunnels a sibling HTTP service has opened (e.g. `up api`).
+    // Worker services (no inbound port) skip the inbound-routing path:
+    // no SSH reverse forward, no ALB rule, no bastion control-plane
+    // registration. They may still open outbound SSM forwards through
+    // the bastion (e.g. so the worker can query staging RDS).
     let Some(local_service_port) = req.local_service_port else {
-        return up_worker(req).await;
+        return up_worker(req, ctx).await;
     };
 
     // Fail fast if the SSM plugin isn't installed: every port-forward
@@ -427,13 +427,58 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     })
 }
 
-/// Worker-mode `up`: bootstrap_command + run_command, no bastion.
-/// Returns once `run_command` is spawned. The caller awaits the child
-/// process via `ActiveSession`.
-async fn up_worker(req: UpRequest) -> Result<ActiveSession> {
+/// Worker-mode `up`: bootstrap_command + outbound forward_ports +
+/// run_command. No inbound HTTP routing (no SSH reverse forward, no
+/// ALB rule, no bastion registration), but the worker may still need
+/// to talk to VPC-private hosts (e.g. staging RDS) — those use the
+/// same SSM `AWS-StartPortForwardingSessionToRemoteHost` machinery
+/// the HTTP path uses, so the bastion still gets provisioned/located
+/// when forward_ports is non-empty. With no forward_ports, this is
+/// a pure local spawn.
+async fn up_worker(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession> {
+    let needs_bastion = !req.forward_ports.is_empty();
+
+    if needs_bastion {
+        assert_plugin_available().context("session-manager-plugin pre-flight")?;
+    }
+
     if let Some(cmd) = req.bootstrap_command.as_deref() {
         tracing::info!(bootstrap = %cmd, "running bootstrap_command");
         run_bootstrap(cmd).context("bootstrap_command")?;
+    }
+
+    let mut forward_ssm: Vec<SsmTunnel> = Vec::with_capacity(req.forward_ports.len());
+    if needs_bastion {
+        let mut provisioner =
+            AwsBastionProvisioner::new(req.region.clone(), ctx.clone()).await?;
+        let bastion = locate_bastion(&mut provisioner, &ctx)?;
+
+        for raw in &req.forward_ports {
+            let spec = parse_forward_port_spec(raw)?;
+            assert_port_free(spec.local_port).with_context(|| {
+                format!(
+                    "forward {raw}: local port already in use \
+                     (another `ephemwork up` may already be forwarding it)"
+                )
+            })?;
+            let tunnel = start_remote_host_forward(&RemoteHostForwardSpec {
+                target: bastion.instance_id.clone(),
+                remote_host: spec.remote_host.clone(),
+                remote_port: spec.remote_port,
+                local_port: spec.local_port,
+                region: req.region.clone(),
+            })
+            .with_context(|| format!("opening forward {raw}"))?;
+            wait_for_local_port(spec.local_port, Duration::from_secs(15))
+                .with_context(|| format!("forward {raw} never became reachable"))?;
+            tracing::info!(
+                local = spec.local_port,
+                host = %spec.remote_host,
+                remote = spec.remote_port,
+                "outbound forward open"
+            );
+            forward_ssm.push(tunnel);
+        }
     }
 
     let service = spawn_service(&req.run_command, Stdio::inherit(), Stdio::inherit())?;
@@ -453,7 +498,7 @@ async fn up_worker(req: UpRequest) -> Result<ActiveSession> {
         runner: Some(service),
         ssh_ssm: None,
         cp_ssm: None,
-        forward_ssm: Vec::new(),
+        forward_ssm,
         cp_endpoint: None,
     })
 }
@@ -826,7 +871,8 @@ mod tests {
             forward_ports: Vec::new(),
             bootstrap_command: Some(format!("touch {}", bootstrap_marker.display())),
         };
-        let session = up_worker(req).await.unwrap();
+        let ctx = BastionContext::new("demo");
+        let session = up_worker(req, ctx).await.unwrap();
 
         // bootstrap_command runs synchronously before run_command; its
         // marker must exist by the time up_worker returns.
@@ -860,7 +906,8 @@ mod tests {
             forward_ports: Vec::new(),
             bootstrap_command: Some("exit 7".into()),
         };
-        let err = match up_worker(req).await {
+        let ctx = BastionContext::new("demo");
+        let err = match up_worker(req, ctx).await {
             Ok(_) => panic!("expected bootstrap_command failure"),
             Err(e) => e.to_string(),
         };
