@@ -17,7 +17,7 @@ use crate::runner::{
 };
 use crate::ssm::{
     assert_plugin_available, parse_forward_port_spec, start_port_forward,
-    start_remote_host_forward, PortForwardSpec, RemoteHostForwardSpec, SsmTunnel,
+    start_remote_host_forward, ForwardPortSpec, PortForwardSpec, RemoteHostForwardSpec, SsmTunnel,
 };
 use crate::state::{default_state_path, Session, State};
 use crate::tunnel::{open_ssh2_reverse_forward, ReverseForward, SshAuth, SshConfig};
@@ -157,12 +157,18 @@ pub fn register_with_bastion(
 }
 
 /// Build a Session for a freshly-registered tunnel. Separated out for testing.
+///
+/// `forward_local_ports` should contain only the ports this session
+/// actually opened (not ones it borrowed from a sibling). Sibling
+/// sessions consult this list to decide whether they need to open
+/// their own SSM tunnel for a given `forward_ports` entry.
 pub fn session_for(
     user: &str,
     service: &str,
     local_port: u16,
     remote_port: u16,
     pid: Option<u32>,
+    forward_local_ports: Vec<u16>,
 ) -> Session {
     Session {
         user: user.into(),
@@ -171,7 +177,57 @@ pub fn session_for(
         local_port,
         remote_port,
         pid,
+        forward_local_ports,
     }
+}
+
+/// Probe whether `pid` exists and we have permission to signal it.
+/// Used to decide whether a `forward_owner` claim in state.json is
+/// still live or stale. `kill(pid, 0)` is signal-free; it just
+/// returns 0 on success and -1 with errno=ESRCH for a dead pid.
+fn pid_is_alive(pid: u32) -> bool {
+    // SAFETY: libc::kill is FFI; sig=0 has no side effects.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Decide whether a `forward_ports` entry can ride on an existing
+/// SSM tunnel opened by a sibling session of the same user. Returns:
+///   - `Ok(true)`  → port is already forwarded by a live sibling;
+///                    don't open a new tunnel.
+///   - `Ok(false)` → no live owner; the caller should open the tunnel.
+///   - `Err(...)`  → ambiguous (port bound by an unknown process, or
+///                    bound by a *dead* sibling whose tunnel we can't
+///                    reuse safely).
+fn check_forward_reuse(
+    state: &State,
+    user: &str,
+    spec: &ForwardPortSpec,
+) -> Result<bool> {
+    let Some(owner) = state.forward_owner(user, spec.local_port) else {
+        return Ok(false);
+    };
+    let pid = owner.pid.unwrap_or(0);
+    if pid == 0 || !pid_is_alive(pid) {
+        return Err(anyhow!(
+            "local port {} is recorded as owned by sibling session \
+             {:?} (pid {:?}), but that process is no longer running. \
+             Run `ephemwork down {service}` to clear the stale entry, \
+             then retry.",
+            spec.local_port,
+            owner.service,
+            owner.pid,
+            service = owner.service
+        ));
+    }
+    tracing::info!(
+        local = spec.local_port,
+        host = %spec.remote_host,
+        remote = spec.remote_port,
+        owner_service = %owner.service,
+        owner_pid = ?owner.pid,
+        "reusing forward already opened by sibling session"
+    );
+    Ok(true)
 }
 
 /// Configuration for the `up` flow. Inputs come from the CLI args + the
@@ -348,10 +404,19 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
 
     // Outbound forwards through the bastion to VPC-private hosts (e.g.
     // staging RDS). Opened before the local service starts so e.g. uvicorn
-    // can resolve its DB connection on first boot.
-    let mut forward_ssm: Vec<SsmTunnel> = Vec::with_capacity(req.forward_ports.len());
+    // can resolve its DB connection on first boot. If a sibling session
+    // (same user) has already opened this local port, reuse instead of
+    // colliding — keeps `up api` + `up engine-worker` from fighting over
+    // 5432 when both declare the same forward.
+    let state_for_reuse = State::load(&default_state_path()?)?;
+    let mut forward_ssm: Vec<SsmTunnel> = Vec::new();
+    let mut owned_local_ports: Vec<u16> = Vec::new();
     for raw in &req.forward_ports {
         let spec = parse_forward_port_spec(raw)?;
+        if check_forward_reuse(&state_for_reuse, &req.user, &spec)? {
+            // Sibling owns it — nothing to open, nothing to close on Drop.
+            continue;
+        }
         let tunnel = start_remote_host_forward(&RemoteHostForwardSpec {
             target: bastion.instance_id.clone(),
             remote_host: spec.remote_host.clone(),
@@ -369,6 +434,7 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
             "outbound forward open"
         );
         forward_ssm.push(tunnel);
+        owned_local_ports.push(spec.local_port);
     }
 
     // Spawn the local service and wait for its health endpoint, if any.
@@ -402,13 +468,16 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
         remote_port,
     )?;
 
-    // Persist for `status` / orphan cleanup.
+    // Persist for `status` / orphan cleanup. `forward_local_ports`
+    // records only the ones this session opened (not borrowed); a
+    // future sibling consults this list before opening its own.
     let session = session_for(
         &req.user,
         &req.service,
         local_service_port,
         remote_port,
         Some(pid),
+        owned_local_ports,
     );
     record_session(&default_state_path()?, session)?;
 
@@ -447,18 +516,23 @@ async fn up_worker(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession>
         run_bootstrap(cmd).context("bootstrap_command")?;
     }
 
-    let mut forward_ssm: Vec<SsmTunnel> = Vec::with_capacity(req.forward_ports.len());
+    let mut forward_ssm: Vec<SsmTunnel> = Vec::new();
+    let mut owned_local_ports: Vec<u16> = Vec::new();
     if needs_bastion {
         let mut provisioner =
             AwsBastionProvisioner::new(req.region.clone(), ctx.clone()).await?;
         let bastion = locate_bastion(&mut provisioner, &ctx)?;
 
+        let state_for_reuse = State::load(&default_state_path()?)?;
         for raw in &req.forward_ports {
             let spec = parse_forward_port_spec(raw)?;
+            if check_forward_reuse(&state_for_reuse, &req.user, &spec)? {
+                continue;
+            }
             assert_port_free(spec.local_port).with_context(|| {
                 format!(
-                    "forward {raw}: local port already in use \
-                     (another `ephemwork up` may already be forwarding it)"
+                    "forward {raw}: local port in use by an unknown \
+                     process (no sibling ephemwork session owns it)"
                 )
             })?;
             let tunnel = start_remote_host_forward(&RemoteHostForwardSpec {
@@ -478,6 +552,7 @@ async fn up_worker(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession>
                 "outbound forward open"
             );
             forward_ssm.push(tunnel);
+            owned_local_ports.push(spec.local_port);
         }
     }
 
@@ -485,7 +560,7 @@ async fn up_worker(req: UpRequest, ctx: BastionContext) -> Result<ActiveSession>
     let pid = service.pid;
 
     // local_port=0/remote_port=0 in state.json marks this as a worker.
-    let session = session_for(&req.user, &req.service, 0, 0, Some(pid));
+    let session = session_for(&req.user, &req.service, 0, 0, Some(pid), owned_local_ports);
     record_session(&default_state_path()?, session)?;
 
     Ok(ActiveSession {
@@ -660,7 +735,7 @@ mod tests {
     fn record_then_forget_round_trips() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let s = session_for("matheus", "api", 8000, 9001, Some(42));
+        let s = session_for("matheus", "api", 8000, 9001, Some(42), Vec::new());
         record_session(&path, s.clone()).unwrap();
 
         let state = State::load(&path).unwrap();
@@ -680,8 +755,8 @@ mod tests {
     fn forget_sessions_filters_by_user() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.json");
-        record_session(&path, session_for("alice", "api", 1, 2, None)).unwrap();
-        record_session(&path, session_for("bob", "api", 3, 4, None)).unwrap();
+        record_session(&path, session_for("alice", "api", 1, 2, None, Vec::new())).unwrap();
+        record_session(&path, session_for("bob", "api", 3, 4, None, Vec::new())).unwrap();
         let removed = forget_sessions(&path, |s| s.user == "alice").unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].user, "alice");
@@ -705,7 +780,7 @@ mod tests {
     fn render_status_lists_sessions() {
         let out = StatusOutput {
             user: "matheus".into(),
-            sessions: vec![session_for("matheus", "api", 8000, 9001, Some(42))],
+            sessions: vec![session_for("matheus", "api", 8000, 9001, Some(42), Vec::new())],
         };
         let s = render_status(&out);
         assert!(s.contains("api"));
@@ -912,5 +987,74 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("bootstrap_command"), "got: {err}");
+    }
+
+    fn forward_spec(local: u16) -> ForwardPortSpec {
+        ForwardPortSpec {
+            local_port: local,
+            remote_host: "rds.example.com".into(),
+            remote_port: 5432,
+        }
+    }
+
+    #[test]
+    fn check_forward_reuse_returns_false_when_no_owner() {
+        let state = State::default();
+        let reused = check_forward_reuse(&state, "alice", &forward_spec(5432)).unwrap();
+        assert!(!reused);
+    }
+
+    #[test]
+    fn check_forward_reuse_returns_true_when_live_sibling_owns_it() {
+        // Use our own pid as the "live" sibling — it's guaranteed to
+        // exist for the duration of this test.
+        let our_pid = std::process::id();
+        let mut state = State::default();
+        state.upsert(session_for(
+            "alice",
+            "api",
+            8000,
+            10000,
+            Some(our_pid),
+            vec![5432],
+        ));
+        let reused = check_forward_reuse(&state, "alice", &forward_spec(5432)).unwrap();
+        assert!(reused);
+    }
+
+    #[test]
+    fn check_forward_reuse_errors_on_stale_dead_owner() {
+        // Pick a pid that's almost certainly dead (max u32).
+        let mut state = State::default();
+        state.upsert(session_for(
+            "alice",
+            "api",
+            8000,
+            10000,
+            Some(u32::MAX - 1),
+            vec![5432],
+        ));
+        let err = check_forward_reuse(&state, "alice", &forward_spec(5432))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer running"), "got: {err}");
+        assert!(err.contains("ephemwork down"), "got: {err}");
+    }
+
+    #[test]
+    fn check_forward_reuse_ignores_other_users() {
+        let our_pid = std::process::id();
+        let mut state = State::default();
+        // Bob owns 5432 — alice's lookup must NOT reuse it.
+        state.upsert(session_for(
+            "bob",
+            "api",
+            8000,
+            10000,
+            Some(our_pid),
+            vec![5432],
+        ));
+        let reused = check_forward_reuse(&state, "alice", &forward_spec(5432)).unwrap();
+        assert!(!reused);
     }
 }
