@@ -58,11 +58,46 @@ async fn up(args: UpArgs) -> anyhow::Result<()> {
     println!();
     println!("Press Ctrl-C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    // Race Ctrl-C with the SSH tunnel's dead-session flag. If the reverse
+    // forward dies (network blip, bastion restart, suspend/resume), keeping
+    // ephemwork running just means the bastion's nginx 502s every tagged
+    // request — surface the death immediately so the developer can re-run.
+    let exit_reason = tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            "ctrl-c"
+        }
+        _ = wait_for_tunnel_death(&session) => {
+            "tunnel-died"
+        }
+    };
+
     println!();
-    println!("Shutting down…");
+    match exit_reason {
+        "tunnel-died" => println!(
+            "✗ SSH reverse tunnel to the bastion died (network drop / bastion \
+             restart / suspend). Re-run `ephemwork up {}` to reconnect.",
+            session.service
+        ),
+        _ => println!("Shutting down…"),
+    }
     session.shutdown();
+    if exit_reason == "tunnel-died" {
+        std::process::exit(2);
+    }
     Ok(())
+}
+
+async fn wait_for_tunnel_death(session: &ephemwork::commands::ActiveSession) {
+    // Poll once a second; this is a long-lived watchdog so the cost is
+    // negligible. We don't try to hook into ssh2 callbacks because the
+    // worker thread is sync and re-entry from tokio is awkward.
+    loop {
+        if session.tunnel_is_dead() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn down(args: DownArgs) -> anyhow::Result<()> {
