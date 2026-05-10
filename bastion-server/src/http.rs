@@ -116,24 +116,61 @@ fn find_header_terminator(raw: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Categorized error from `read_request`. The connection handler logs each
+/// variant at the appropriate level — empty connections from health-check
+/// probes are noise; truncated or oversized requests from real misuse
+/// deserve attention.
+#[derive(Debug)]
+pub enum RequestError {
+    /// Peer closed the connection without sending a single byte. Common
+    /// from external port scans / ALB-style TCP-only health probes; not
+    /// worth surfacing.
+    EmptyConnection,
+    /// Some bytes received but the header block didn't terminate before EOF.
+    Truncated { bytes: usize },
+    /// Request body exceeded the size cap before headers terminated.
+    Oversized { cap: usize },
+    /// Headers were complete but couldn't be parsed.
+    Malformed(anyhow::Error),
+    /// Underlying socket I/O failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::EmptyConnection => write!(f, "peer closed without data"),
+            RequestError::Truncated { bytes } => {
+                write!(f, "request truncated after {bytes} bytes (no header terminator)")
+            }
+            RequestError::Oversized { cap } => {
+                write!(f, "request exceeded {cap} bytes")
+            }
+            RequestError::Malformed(e) => write!(f, "malformed: {e}"),
+            RequestError::Io(e) => write!(f, "socket I/O: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
 /// Read enough of `stream` to materialize one complete request. Stops at the
 /// header terminator or after `Content-Length` body bytes are in hand,
 /// whichever is later. Bounded to 64 KiB to avoid OOM on a tiny bastion.
-pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
+pub fn read_request<S: Read>(stream: &mut S) -> Result<Request, RequestError> {
     const MAX: usize = 64 * 1024;
     let mut buf = Vec::with_capacity(2048);
     let mut tmp = [0u8; 2048];
     loop {
         if buf.len() >= MAX {
-            return Err(anyhow!("request exceeded {MAX} bytes"));
+            return Err(RequestError::Oversized { cap: MAX });
         }
-        let n = stream.read(&mut tmp).context("reading from socket")?;
+        let n = stream.read(&mut tmp).map_err(RequestError::Io)?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some((_, body_start)) = find_header_terminator(&buf) {
-            // Compute expected total once headers are in.
             let head = std::str::from_utf8(&buf[..body_start.saturating_sub(1)]).unwrap_or("");
             let cl: usize = head
                 .split('\n')
@@ -153,7 +190,13 @@ pub fn read_request<S: Read>(stream: &mut S) -> Result<Request> {
             }
         }
     }
-    parse_request(&buf)
+    if buf.is_empty() {
+        return Err(RequestError::EmptyConnection);
+    }
+    if find_header_terminator(&buf).is_none() {
+        return Err(RequestError::Truncated { bytes: buf.len() });
+    }
+    parse_request(&buf).map_err(RequestError::Malformed)
 }
 
 pub fn write_response<S: Write>(stream: &mut S, response: &Response) -> Result<()> {
@@ -223,6 +266,24 @@ mod tests {
     }
 
     #[test]
+    fn read_request_returns_empty_connection_for_zero_bytes() {
+        let mut cur = Cursor::new(Vec::new());
+        let err = read_request(&mut cur).unwrap_err();
+        assert!(matches!(err, RequestError::EmptyConnection), "got: {err:?}");
+    }
+
+    #[test]
+    fn read_request_returns_truncated_when_eof_before_terminator() {
+        // Some bytes but no header terminator before EOF.
+        let mut cur = Cursor::new(b"GET /partial HTTP/1.0".to_vec());
+        let err = read_request(&mut cur).unwrap_err();
+        match err {
+            RequestError::Truncated { bytes } => assert!(bytes > 0),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn read_request_assembles_from_chunks() {
         // Cursor delivers all bytes in one read, but parse_request handles
         // the same wire format we'd see across multiple reads.
@@ -240,6 +301,9 @@ mod tests {
         // Headers without terminator force the loop to keep reading.
         big.extend(std::iter::repeat(b'A').take(70 * 1024));
         let mut cur = Cursor::new(big);
-        assert!(read_request(&mut cur).is_err());
+        match read_request(&mut cur).unwrap_err() {
+            RequestError::Oversized { cap } => assert_eq!(cap, 64 * 1024),
+            other => panic!("expected Oversized, got {other:?}"),
+        }
     }
 }
