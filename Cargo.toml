@@ -32,6 +32,7 @@ chrono = { version = "0.4", features = ["serde"] }
 serde_json = { workspace = true }
 ssh2 = "0.9"
 url = "2.5"
+libc = "0.2"
 ephemwork-common = { workspace = true }
 
 [dev-dependencies]

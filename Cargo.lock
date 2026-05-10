@@ -828,6 +828,7 @@ dependencies = [
  "chrono",
  "clap",
  "ephemwork-common",
+ "libc",
  "rand",
  "serde",
  "serde_json",

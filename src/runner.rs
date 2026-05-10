@@ -8,6 +8,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,29 @@ impl RunningService {
 
 impl Drop for RunningService {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // The child is `sh -c <run_command>`, which itself fork/execs the
+        // real workload (uvicorn, npm, etc.). `Child::kill()` only signals
+        // sh; its descendants get reparented to init and keep running —
+        // leaving an orphan listener on the service port that breaks the
+        // next `ephemwork up`. We make `sh` a process-group leader in
+        // `spawn_service` and SIGTERM the whole group here, falling back
+        // to SIGKILL after a short grace period.
+        let pid = self.child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() >= deadline => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
         let _ = self.child.wait();
     }
 }
@@ -91,6 +114,11 @@ pub fn assert_port_free(port: u16) -> Result<()> {
 
 /// Spawn `run_command` via `sh -c`, inheriting the current environment.
 /// stdout/stderr go to whatever pipes the caller wants.
+///
+/// The child is placed in a fresh process group (its own PGID == PID) so
+/// that `RunningService::drop` can signal the whole tree on shutdown.
+/// Without this, a `cd back-end && uv run uvicorn …` style run_command
+/// leaves uvicorn alive after the parent `sh` is killed.
 pub fn spawn_service(
     run_command: &str,
     stdout: Stdio,
@@ -101,6 +129,7 @@ pub fn spawn_service(
         .arg(run_command)
         .stdout(stdout)
         .stderr(stderr)
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawning `sh -c {run_command:?}`"))?;
     Ok(RunningService::from_child(child))
@@ -375,5 +404,51 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(!alive, "child {pid} should have been killed by drop");
+    }
+
+    #[test]
+    fn spawn_service_drop_kills_grandchildren_too() {
+        // Real-world `run_command`s look like `cd back-end && uv run
+        // uvicorn …` — uvicorn is a grandchild of the `sh -c` direct
+        // child. Without process-group cleanup, killing sh leaves the
+        // grandchild orphaned and still listening on the service port.
+        // Reproduce by writing the grandchild's PID to a temp file so we
+        // can poll it after Drop runs.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pid_path = tmp.path().to_owned();
+        let cmd = format!(
+            "sh -c 'echo $$ > {} && exec sleep 30' & wait",
+            pid_path.display()
+        );
+        let svc = spawn_service(&cmd, Stdio::null(), Stdio::null()).unwrap();
+
+        // Wait for the grandchild to record its PID.
+        let started = Instant::now();
+        let grandchild_pid: u32 = loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_path) {
+                if let Ok(p) = s.trim().parse::<u32>() {
+                    break p;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "grandchild never wrote its PID"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        drop(svc);
+        thread::sleep(Duration::from_millis(300));
+        let alive = Command::new("kill")
+            .args(["-0", &grandchild_pid.to_string()])
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !alive,
+            "grandchild {grandchild_pid} should have been killed by process-group SIGTERM"
+        );
     }
 }
