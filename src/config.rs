@@ -35,7 +35,14 @@ pub struct TunnelConfig {
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct ServiceConfig {
-    pub port: u16,
+    /// Port the local service listens on. When set, ephemwork tunnels
+    /// X-Ephemwork-tagged staging traffic to `127.0.0.1:<port>` via the
+    /// bastion. Omit (or set to 0) for a "worker" service that doesn't
+    /// receive HTTP — e.g. a local SQS poller. Workers skip the bastion
+    /// entirely; ephemwork just runs `bootstrap_command` and
+    /// `run_command`.
+    #[serde(default)]
+    pub port: Option<u16>,
     pub build_command: Option<String>,
     pub run_command: String,
     pub health_check_path: Option<String>,
@@ -102,11 +109,18 @@ impl Config {
             ));
         }
         for (name, svc) in &self.service {
-            if svc.port == 0 {
-                return Err(anyhow!("service.{name}: port must be > 0"));
+            if matches!(svc.port, Some(0)) {
+                return Err(anyhow!(
+                    "service.{name}: port=0 is not valid; omit `port` for a worker service"
+                ));
             }
             if svc.run_command.trim().is_empty() {
                 return Err(anyhow!("service.{name}: run_command must not be empty"));
+            }
+            if svc.port.is_none() && !svc.forward_ports.is_empty() {
+                return Err(anyhow!(
+                    "service.{name}: forward_ports requires `port` (worker services don't open SSM tunnels — run an HTTP service alongside to share its tunnels)"
+                ));
             }
         }
         Ok(())
@@ -197,7 +211,7 @@ run_command = "npm run dev"
         let cfg = Config::from_toml_str(valid_toml()).unwrap();
         assert_eq!(cfg.tunnel.region, "us-east-1");
         assert_eq!(cfg.tunnel.r#type, "ec2");
-        assert_eq!(cfg.service["api"].port, 8000);
+        assert_eq!(cfg.service["api"].port, Some(8000));
         assert_eq!(cfg.service["api"].health_check_path.as_deref(), Some("/health"));
         assert_eq!(cfg.service["front-end"].build_command.as_deref(), Some("npm install"));
         assert!(cfg.service["front-end"].health_check_path.is_none());
@@ -241,6 +255,8 @@ project_name = "demo"
 
     #[test]
     fn validate_rejects_zero_port() {
+        // 0 is reserved as a "wrong way to opt into worker mode" — the
+        // intended way is to omit the port field entirely.
         let toml = r#"
 [tunnel]
 type = "ec2"
@@ -254,7 +270,42 @@ run_command = "x"
 "#;
         let cfg = Config::from_toml_str(toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("port must be > 0"), "got: {err}");
+        assert!(err.contains("omit `port`"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_worker_service_with_no_port() {
+        let toml = r#"
+[tunnel]
+type = "ec2"
+region = "us-east-1"
+instance_type = "t4g.nano"
+project_name = "demo"
+
+[service.engine-worker]
+run_command = "uv run python -m app.lambdas.run_local engine_worker"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.service["engine-worker"].port, None);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_worker_with_forward_ports() {
+        let toml = r#"
+[tunnel]
+type = "ec2"
+region = "us-east-1"
+instance_type = "t4g.nano"
+project_name = "demo"
+
+[service.engine-worker]
+run_command = "x"
+forward_ports = ["5432:db.example.com:5432"]
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("forward_ports requires `port`"), "got: {err}");
     }
 
     #[test]
