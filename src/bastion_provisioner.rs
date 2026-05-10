@@ -247,6 +247,22 @@ systemctl enable --now ephemwork-bastion.service
     ))
 }
 
+/// Bash script used by `ephemwork bastion redeploy` to swap the new
+/// arm64 binary in and bounce the systemd unit. Kept pure (no IO) so
+/// tests can pin the command sequence.
+pub fn redeploy_script(s3_uri: &str) -> String {
+    format!(
+        "set -eux\n\
+         aws s3 cp {s3_uri} /opt/ephemwork/bastion-server.new\n\
+         chmod 0755 /opt/ephemwork/bastion-server.new\n\
+         mv /opt/ephemwork/bastion-server.new /opt/ephemwork/bastion-server\n\
+         systemctl restart ephemwork-bastion.service\n\
+         sleep 2\n\
+         systemctl is-active ephemwork-bastion\n\
+         curl -sf http://127.0.0.1:8443/healthz && echo control-plane-ok"
+    )
+}
+
 /// Tags applied to the launched instance so `bastion status`/`destroy` can
 /// find it again.
 pub fn instance_tags(ctx: &BastionContext) -> BTreeMap<String, String> {
@@ -593,6 +609,25 @@ mod tests {
     fn user_data_script_requires_s3_uri() {
         let err = user_data_script("https://wrong", None).unwrap_err().to_string();
         assert!(err.contains("s3://"), "got: {err}");
+    }
+
+    #[test]
+    fn redeploy_script_includes_swap_and_health_check() {
+        let s = redeploy_script("s3://my-bucket/ephemwork-bastion-server");
+        assert!(s.contains("aws s3 cp s3://my-bucket/ephemwork-bastion-server"));
+        assert!(s.contains("/opt/ephemwork/bastion-server.new"));
+        assert!(s.contains("mv /opt/ephemwork/bastion-server.new /opt/ephemwork/bastion-server"));
+        assert!(s.contains("systemctl restart ephemwork-bastion.service"));
+        assert!(s.contains("systemctl is-active ephemwork-bastion"));
+        assert!(s.contains("curl -sf http://127.0.0.1:8443/healthz"));
+        // Atomic swap: download to .new first, only mv into place after chmod.
+        let cp_idx = s.find("aws s3 cp").unwrap();
+        let chmod_idx = s.find("chmod 0755").unwrap();
+        let mv_idx = s.find("mv /opt/ephemwork/bastion-server.new").unwrap();
+        let restart_idx = s.find("systemctl restart").unwrap();
+        assert!(cp_idx < chmod_idx);
+        assert!(chmod_idx < mv_idx);
+        assert!(mv_idx < restart_idx);
     }
 
     #[test]
