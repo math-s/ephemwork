@@ -12,7 +12,8 @@ use crate::bastion_protocol::{DeregisterRequest, RegisterRequest};
 use crate::bastion_provisioner::{BastionContext, BastionProvisioner, InstanceSummary};
 use crate::config::{current_user, Config};
 use crate::runner::{
-    assert_port_free, spawn_service, wait_for_health, HealthCheck, RunningService,
+    assert_port_free, run_bootstrap, spawn_service, wait_for_health, HealthCheck,
+    RunningService,
 };
 use crate::ssm::{
     assert_plugin_available, parse_forward_port_spec, start_port_forward,
@@ -190,6 +191,9 @@ pub struct UpRequest {
     /// Raw `"local:host:remote"` strings from `service.<name>.forward_ports`.
     /// Validated at request build time; opened via SSM in `up_service`.
     pub forward_ports: Vec<String>,
+    /// Optional shell command run before `run_command` (and before any
+    /// tunnel is opened). See `ServiceConfig::bootstrap_command`.
+    pub bootstrap_command: Option<String>,
 }
 
 impl UpRequest {
@@ -214,6 +218,7 @@ impl UpRequest {
             ssh_keepalive: Duration::from_secs(30),
             health_timeout: Duration::from_secs(60),
             forward_ports: svc.forward_ports.clone(),
+            bootstrap_command: svc.bootstrap_command.clone(),
         })
     }
 }
@@ -287,6 +292,14 @@ pub async fn up_service(req: UpRequest, ctx: BastionContext) -> Result<ActiveSes
     // similar) errors deep into startup with a cryptic EADDRINUSE.
     assert_port_free(req.local_service_port)
         .with_context(|| format!("local port for service {:?}", req.service))?;
+
+    // Project-supplied bootstrap (e.g. hydrate .env.staging from Secrets
+    // Manager). Runs before any tunnel is opened so a credential-fetch
+    // failure aborts before we touch AWS.
+    if let Some(cmd) = req.bootstrap_command.as_deref() {
+        tracing::info!(bootstrap = %cmd, "running bootstrap_command");
+        run_bootstrap(cmd).context("bootstrap_command")?;
+    }
 
     let mut provisioner =
         AwsBastionProvisioner::new(req.region.clone(), ctx.clone()).await?;
@@ -509,6 +522,7 @@ mod tests {
                     run_command: "x".into(),
                     health_check_path: None,
                     forward_ports: Vec::new(),
+                    bootstrap_command: None,
                 },
             );
         }
@@ -643,6 +657,22 @@ mod tests {
             vec!["5432:rds.example.com:5432".into()];
         let req = UpRequest::from_config(&cfg, "api", "matheus").unwrap();
         assert_eq!(req.forward_ports, vec!["5432:rds.example.com:5432"]);
+    }
+
+    #[test]
+    fn up_request_propagates_bootstrap_command() {
+        let mut cfg = cfg_with(&[("api", 8000)]);
+        cfg.service.get_mut("api").unwrap().bootstrap_command =
+            Some("./scripts/bootstrap.sh".into());
+        let req = UpRequest::from_config(&cfg, "api", "matheus").unwrap();
+        assert_eq!(req.bootstrap_command.as_deref(), Some("./scripts/bootstrap.sh"));
+    }
+
+    #[test]
+    fn up_request_no_bootstrap_command_by_default() {
+        let cfg = cfg_with(&[("api", 8000)]);
+        let req = UpRequest::from_config(&cfg, "api", "matheus").unwrap();
+        assert!(req.bootstrap_command.is_none());
     }
 
     #[test]

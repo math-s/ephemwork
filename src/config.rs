@@ -47,6 +47,14 @@ pub struct ServiceConfig {
     /// at `127.0.0.1:<local_port>`.
     #[serde(default)]
     pub forward_ports: Vec<String>,
+
+    /// Optional shell command run before `run_command` on every
+    /// `ephemwork up`. Use it to hydrate env files (e.g. fetch staging
+    /// credentials from Secrets Manager into `.env.staging`), apply
+    /// migrations, or anything else the local service needs in place
+    /// before it starts. Runs via `sh -c` and inherits ephemwork's env;
+    /// a non-zero exit aborts the up flow before any tunnel is opened.
+    pub bootstrap_command: Option<String>,
 }
 
 impl Config {
