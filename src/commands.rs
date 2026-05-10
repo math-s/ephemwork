@@ -249,6 +249,13 @@ impl ActiveSession {
         format!("X-Ephemwork: {}", self.header_value())
     }
 
+    /// True when the reverse-SSH worker reported a fatal SSH error and
+    /// gave up. Used by `main.rs::up` to race ctrl_c with tunnel death so
+    /// the bastion's stale registry entry doesn't keep 502'ing forever.
+    pub fn tunnel_is_dead(&self) -> bool {
+        self.reverse.as_ref().map(|r| r.is_dead()).unwrap_or(false)
+    }
+
     /// Best-effort cleanup: deregister with the bastion, drop the SSH
     /// tunnel, the local process, and both SSM forwards. Does not propagate
     /// errors because Drop semantics already kill the children if anything

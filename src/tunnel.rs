@@ -149,12 +149,39 @@ fn write_all_nonblocking<W: Write>(w: &mut W, mut buf: &[u8]) -> std::io::Result
     Ok(())
 }
 
+/// libssh2 returns this code when an operation would block but the
+/// session is otherwise fine — the "no client trying to connect right
+/// now" case for `Listener::accept`. Anything else from accept tends to
+/// indicate the session itself is unhealthy.
+const LIBSSH2_ERROR_EAGAIN: i32 = -37;
+
+/// Classify an `ssh2::Error` returned by `Listener::accept`. Returns true
+/// when the error indicates the session is dead and the worker should
+/// give up rather than spin. Pure function so the dead-session flow is
+/// unit-testable without a real bastion.
+pub fn is_fatal_ssh_error(e: &ssh2::Error) -> bool {
+    !error_code_is_eagain(e.code())
+}
+
+fn error_code_is_eagain(code: ssh2::ErrorCode) -> bool {
+    match code {
+        ssh2::ErrorCode::Session(c) => c == LIBSSH2_ERROR_EAGAIN,
+        // SFTP errors don't surface from accept; treat as fatal.
+        ssh2::ErrorCode::SFTP(_) => false,
+    }
+}
+
 /// Handle to an active reverse forward. Dropping the handle signals the
 /// worker thread to stop.
 pub struct ReverseForward {
     pub local_port: u16,
     pub remote_port: u16,
     stop: Arc<AtomicBool>,
+    /// Set by the accept-loop worker when libssh2 reports a fatal error
+    /// (anything besides EAGAIN). Callers can poll via `is_dead()` to
+    /// distinguish "no traffic right now" from "session is gone and the
+    /// bastion's view of this tunnel is stale".
+    dead: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -171,8 +198,33 @@ impl ReverseForward {
             local_port,
             remote_port,
             stop,
+            dead: Arc::new(AtomicBool::new(false)),
             worker: Some(worker),
         }
+    }
+
+    /// Test-only constructor that wires in a custom `dead` flag so a unit
+    /// test can simulate the worker setting it.
+    #[doc(hidden)]
+    pub fn from_worker_with_dead(
+        local_port: u16,
+        remote_port: u16,
+        stop: Arc<AtomicBool>,
+        dead: Arc<AtomicBool>,
+        worker: thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            local_port,
+            remote_port,
+            stop,
+            dead,
+            worker: Some(worker),
+        }
+    }
+
+    /// True when the accept loop saw a fatal SSH error and gave up.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     pub fn shutdown(mut self) {
@@ -241,6 +293,8 @@ pub fn open_ssh2_reverse_forward(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
+    let dead = Arc::new(AtomicBool::new(false));
+    let dead_worker = dead.clone();
 
     let worker = thread::spawn(move || {
         let mut listener = listener;
@@ -254,19 +308,25 @@ pub fn open_ssh2_reverse_forward(
                         }
                     });
                 }
-                Err(_) => {
-                    // ssh2 returns errors when there's nothing to accept yet;
-                    // sleep a beat to avoid pegging the CPU.
+                Err(e) => {
+                    if is_fatal_ssh_error(&e) {
+                        tracing::warn!(?e, "SSH session lost; flagging tunnel dead");
+                        dead_worker.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    // EAGAIN ("nothing to accept yet") or another transient
+                    // libssh2 hiccup — sleep a beat and retry.
                     thread::sleep(Duration::from_millis(50));
                 }
             }
         }
     });
 
-    Ok(ReverseForward::from_worker(
+    Ok(ReverseForward::from_worker_with_dead(
         local_port,
         remote_port,
         stop,
+        dead,
         worker,
     ))
 }
@@ -467,6 +527,59 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "bridge did not honor stop flag within 1s"
         );
+    }
+
+    #[test]
+    fn error_code_is_eagain_only_for_minus_37() {
+        assert!(error_code_is_eagain(ssh2::ErrorCode::Session(LIBSSH2_ERROR_EAGAIN)));
+        assert!(!error_code_is_eagain(ssh2::ErrorCode::Session(0)));
+        assert!(!error_code_is_eagain(ssh2::ErrorCode::Session(-13))); // SOCKET_DISCONNECT
+        assert!(!error_code_is_eagain(ssh2::ErrorCode::Session(-43))); // SOCKET_RECV
+        assert!(!error_code_is_eagain(ssh2::ErrorCode::SFTP(2)));
+    }
+
+    #[test]
+    fn reverse_forward_dead_flag_is_observable() {
+        // Construct a ReverseForward whose worker simulates a fatal SSH
+        // error by setting the dead flag immediately.
+        let stop = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_w = dead.clone();
+        let stop_w = stop.clone();
+        let worker = thread::spawn(move || {
+            // Pretend the accept loop saw a fatal error.
+            dead_w.store(true, Ordering::SeqCst);
+            // Idle until told to stop, like the real worker would.
+            while !stop_w.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let handle =
+            ReverseForward::from_worker_with_dead(8000, 9001, stop, dead.clone(), worker);
+
+        // Give the worker a beat to set the flag.
+        for _ in 0..20 {
+            if handle.is_dead() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_dead(), "is_dead() should reflect the worker's flag");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn reverse_forward_dead_flag_default_false() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let worker = thread::spawn(move || {
+            while !stop_w.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let handle = ReverseForward::from_worker(8000, 9001, stop, worker);
+        assert!(!handle.is_dead());
+        handle.shutdown();
     }
 
     #[test]
