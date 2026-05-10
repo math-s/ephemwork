@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
             BastionCommand::Destroy(args) => bastion_destroy(args).await?,
             BastionCommand::Status => bastion_status().await?,
             BastionCommand::Redeploy(args) => bastion_redeploy(args).await?,
+            BastionCommand::Doctor => bastion_doctor().await?,
         },
     }
 
@@ -432,6 +433,133 @@ fn run_ssm_redeploy(region: &str, instance_id: &str, script: &str) -> anyhow::Re
                     ));
                 }
             }
+        }
+    }
+}
+
+async fn bastion_doctor() -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let ctx = ctx_from_config(&cfg);
+    let mut provisioner =
+        AwsBastionProvisioner::new(cfg.tunnel.region.clone(), ctx.clone()).await?;
+
+    let mut issues: Vec<String> = Vec::new();
+    println!("ephemwork bastion doctor for project {:?}", ctx.project_name);
+    println!();
+
+    // 1. Instance lookup.
+    let instance = provisioner.find_instance_by_name(&ctx.instance_name())?;
+    let instance = match instance {
+        Some(i) => {
+            println!("✓ instance: {} ({})", i.instance_id, i.state);
+            if let Some(ip) = &i.private_ip {
+                println!("    private_ip: {ip}");
+            }
+            if let Some(sg) = &i.security_group_id {
+                println!("    security_group: {sg}");
+            }
+            if i.state != "running" {
+                issues.push(format!(
+                    "instance state is {:?} — expected running",
+                    i.state
+                ));
+            }
+            i
+        }
+        None => {
+            println!("✗ no instance tagged Name={}", ctx.instance_name());
+            issues.push("bastion not provisioned".into());
+            print_issues(&issues);
+            return Ok(());
+        }
+    };
+
+    // 2. SSM agent status.
+    println!();
+    match provisioner.ssm_agent_status(&instance.instance_id).await {
+        Ok(Some(info)) if info.ping_status == "Online" => {
+            println!(
+                "✓ SSM agent: Online (v{}, last ping {})",
+                info.agent_version.unwrap_or_else(|| "?".into()),
+                info.last_ping.unwrap_or_else(|| "?".into()),
+            );
+        }
+        Ok(Some(info)) => {
+            println!("⚠  SSM agent: {}", info.ping_status);
+            issues.push(format!("SSM agent ping status is {}", info.ping_status));
+        }
+        Ok(None) => {
+            println!("✗ SSM agent: NOT registered");
+            issues.push(
+                "SSM agent never registered with Systems Manager. Most likely cause: \
+                 VPC endpoint SG doesn't allow bastion → :443 (see check below). Other \
+                 causes: missing IAM role, missing internet egress."
+                    .into(),
+            );
+        }
+        Err(e) => {
+            println!("⚠  SSM agent check failed: {e}");
+            issues.push(format!("SSM agent check failed: {e}"));
+        }
+    }
+
+    // 3. VPC endpoint SG ingress.
+    println!();
+    if let Some(vpc_id) = cfg.tunnel.expected_vpc_id.as_deref() {
+        let bastion_sg = instance
+            .security_group_id
+            .as_deref()
+            .unwrap_or("(unknown)");
+        match provisioner
+            .missing_vpc_endpoint_ingress(vpc_id, bastion_sg)
+            .await
+        {
+            Ok(missing) if missing.is_empty() => {
+                println!("✓ VPC endpoint SGs: all allow bastion → :443");
+            }
+            Ok(missing) => {
+                println!(
+                    "⚠  {} VPC interface endpoint SG(s) don't allow inbound from bastion:",
+                    missing.len()
+                );
+                let profile = std::env::var("AWS_PROFILE").ok();
+                for m in &missing {
+                    println!("    - {} (sg {})", m.endpoint_service, m.endpoint_sg_id);
+                    println!(
+                        "      fix: {}",
+                        m.fix_command(bastion_sg, profile.as_deref())
+                            .replace('\n', "\n            ")
+                    );
+                }
+                issues.push(format!(
+                    "{} VPC endpoint SG(s) need ingress from bastion",
+                    missing.len()
+                ));
+            }
+            Err(e) => {
+                println!("⚠  VPC endpoint SG check failed: {e}");
+                issues.push(format!("VPC endpoint check failed: {e}"));
+            }
+        }
+    } else {
+        println!("(skipping VPC endpoint check — set tunnel.expected_vpc_id)");
+    }
+
+    print_issues(&issues);
+    if !issues.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_issues(issues: &[String]) {
+    println!();
+    if issues.is_empty() {
+        println!("✓ bastion is healthy");
+    } else {
+        println!("✗ {} issue(s):", issues.len());
+        for i in issues {
+            println!("  - {i}");
         }
     }
 }

@@ -21,6 +21,7 @@ use aws_sdk_ec2::types::{
 };
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_iam::Client as IamClient;
+use aws_sdk_ssm::Client as SsmClient;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
@@ -28,8 +29,18 @@ use tokio::task::block_in_place;
 pub struct AwsBastionProvisioner {
     ec2: Ec2Client,
     iam: IamClient,
+    ssm: SsmClient,
     handle: Handle,
     ctx: BastionContext,
+}
+
+/// Report from `AwsBastionProvisioner::ssm_agent_status` so `bastion
+/// doctor` can render whether the bastion is reachable via SSM at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsmAgentInfo {
+    pub ping_status: String,
+    pub agent_version: Option<String>,
+    pub last_ping: Option<String>,
 }
 
 impl AwsBastionProvisioner {
@@ -41,9 +52,39 @@ impl AwsBastionProvisioner {
         Ok(Self {
             ec2: Ec2Client::new(&cfg),
             iam: IamClient::new(&cfg),
+            ssm: SsmClient::new(&cfg),
             handle: Handle::current(),
             ctx,
         })
+    }
+
+    /// Look up the bastion's SSM-agent registration. Returns `None` when
+    /// the agent has never registered (so the laptop's port-forwards
+    /// would error with `TargetNotConnected`).
+    pub async fn ssm_agent_status(&self, instance_id: &str) -> Result<Option<SsmAgentInfo>> {
+        use aws_sdk_ssm::types::InstanceInformationStringFilter;
+        let resp = self
+            .ssm
+            .describe_instance_information()
+            .filters(
+                InstanceInformationStringFilter::builder()
+                    .key("InstanceIds")
+                    .values(instance_id)
+                    .build()
+                    .map_err(|e| anyhow!("filter build: {e}"))?,
+            )
+            .send()
+            .await
+            .with_context(|| format!("describe_instance_information {instance_id}"))?;
+        let info = resp.instance_information_list.unwrap_or_default().into_iter().next();
+        Ok(info.map(|i| SsmAgentInfo {
+            ping_status: i
+                .ping_status
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "Unknown".into()),
+            agent_version: i.agent_version,
+            last_ping: i.last_ping_date_time.map(|t| t.to_string()),
+        }))
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
