@@ -38,6 +38,29 @@ impl Drop for RunningService {
     }
 }
 
+/// Run a project-supplied bootstrap shell command synchronously, propagating
+/// its stdout/stderr to ephemwork's terminal. Used by `up` so projects can
+/// hydrate env files / fetch credentials / run migrations before the long-
+/// lived service starts. A non-zero exit aborts the caller, so a failed
+/// bootstrap surfaces immediately rather than after the SSH tunnel is open.
+pub fn run_bootstrap(command: &str) -> Result<()> {
+    use std::process::Command;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("spawning `sh -c {command:?}`"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "bootstrap_command exited with {:?}",
+            status.code()
+        ));
+    }
+    Ok(())
+}
+
 /// Verify that `127.0.0.1:port` is free *right now*. Run at the top of
 /// the `up` flow so an orphan listener (e.g. a uvicorn from a previous
 /// `ephemwork up` that was killed before its child reaped) surfaces a
@@ -276,6 +299,29 @@ mod tests {
                 || err.contains("connection"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn run_bootstrap_returns_ok_for_zero_exit() {
+        run_bootstrap("true").expect("`true` should succeed");
+    }
+
+    #[test]
+    fn run_bootstrap_propagates_non_zero_exit() {
+        let err = run_bootstrap("exit 7").unwrap_err().to_string();
+        assert!(err.contains("7"), "got: {err}");
+        assert!(err.contains("bootstrap_command"), "got: {err}");
+    }
+
+    #[test]
+    fn run_bootstrap_errors_when_shell_can_not_spawn() {
+        // sh is essentially always present, so we exercise the "command
+        // ran but failed" path here. The 127 exit means "command not
+        // found" inside sh, surfaced cleanly.
+        let err = run_bootstrap("nonexistent-binary-zzzzz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bootstrap_command"), "got: {err}");
     }
 
     #[test]

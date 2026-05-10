@@ -18,6 +18,10 @@ port = 8080
 build_command = "cargo build"
 run_command = "cargo run"
 health_check_path = "/health"
+# Optional: shell command run before run_command on every `ephemwork up`.
+# Use it to hydrate env files (e.g. fetch staging credentials), apply
+# migrations, etc. Aborts the up flow on non-zero exit.
+# bootstrap_command = "./scripts/bootstrap-staging-env.sh"
 
 [service.worker]
 port = 9090
